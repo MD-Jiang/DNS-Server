@@ -1,0 +1,10 @@
+services:
+  dns-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dns-server:latest
+    container_name: dns-server
+    ports:
+      - "2053:2053/udp"
+    restart: unless-stopped

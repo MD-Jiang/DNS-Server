@@ -1,0 +1,6 @@
+build/
+.git/
+.vscode/
+.codecrafters/
+*.user
+*.suo
