@@ -1,10 +1,23 @@
-# name type rdata...
-example.com. A 8.8.8.8
-example.com. AAAA 2001:4860:4860::8888
-www.example.com. CNAME example.com.
-example.com. MX 10 mail.example.com.
-example.com. TXT dns-server-demo
-example.com. NS ns1.example.com.
-example.com. SOA ns1.example.com. hostmaster.example.com. 1 3600 600 86400 300
-ns1.example.com. A 192.0.2.53
-mail.example.com. A 192.0.2.25
+$ORIGIN example.test.
+$TTL 300
+@       IN SOA ns1.example.test. admin.example.test. (
+                2025010101 ; serial
+                3600       ; refresh
+                600        ; retry
+                86400      ; expire
+                300        ; minimum
+)
+        IN NS  ns1.example.test.
+        IN NS  ns2.example.test.
+
+ns1     IN A   192.0.2.10
+ns2     IN A   192.0.2.11
+@       IN A   192.0.2.20
+www     IN A   192.0.2.20
+api     IN A   192.0.2.21
+mail    IN A   192.0.2.22
+@       IN MX  10 mail.example.test.
+localhost IN A 127.0.0.1
+ipv6    IN AAAA 2001:db8::20
+alias   IN CNAME www.example.test.
+txt     IN TXT "DNS test record"

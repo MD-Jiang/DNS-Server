@@ -91,6 +91,22 @@ dig @127.0.0.1 -p 15353 example.com A +tcp
 docker compose down
 ```
 
+## Python 黑盒测试
+
+测试脚本只使用 Python 标准库，不依赖 `dig` 或 `nslookup`。本机测试：
+
+```powershell
+python tests/test_dns_server.py --skip-upstream
+```
+
+从宿主机或同一局域网的另一台机器测试时，指定运行 Docker 主机的局域网地址：
+
+```powershell
+python tests/test_dns_server.py --host 10.29.106.156 --skip-upstream
+```
+
+脚本会测试 UDP/TCP、本地 A/AAAA/CNAME、NXDOMAIN 和多 Question。测试上游转发时去掉 `--skip-upstream`；上游 DNS 不可达时，该项会失败，但不会影响本地权威记录测试。
+
 ## 项目结构
 
 ```text

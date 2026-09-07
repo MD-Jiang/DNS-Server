@@ -2,7 +2,8 @@
 
 #include <algorithm>
 
-ThreadPool::ThreadPool(const std::size_t thread_count) {
+ThreadPool::ThreadPool(const std::size_t thread_count, const std::size_t max_queue_size)
+    : max_queue_size_(std::max<std::size_t>(max_queue_size, 1)) {
     const std::size_t count = std::max<std::size_t>(thread_count, 1);
     workers_.reserve(count);
     for (std::size_t index = 0; index < count; ++index) {
@@ -12,14 +13,15 @@ ThreadPool::ThreadPool(const std::size_t thread_count) {
 
 ThreadPool::~ThreadPool() { stop(); }
 
-void ThreadPool::submit(std::function<void()> task) {
-    if (!task) return;
+bool ThreadPool::submit(std::function<void()> task) {
+    if (!task) return false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stopping_) return;
+        if (stopping_ || tasks_.size() >= max_queue_size_) return false;
         tasks_.push(std::move(task));
     }
     condition_.notify_one();
+    return true;
 }
 
 void ThreadPool::stop() {

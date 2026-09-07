@@ -8,6 +8,7 @@
 #include <array>
 #include <iostream>
 #include <netinet/in.h>
+#include <netdb.h>
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/signalfd.h>
@@ -21,6 +22,35 @@ void close_fd(int& fd) {
         close(fd);
         fd = -1;
     }
+}
+
+bool parse_upstream_address(const std::string& value, sockaddr_in& address) {
+    std::string host = value;
+    std::uint16_t port = 53;
+    const std::size_t separator = value.rfind(':');
+    if (separator != std::string::npos && value.find(':') == separator) {
+        host = value.substr(0, separator);
+        try { port = static_cast<std::uint16_t>(std::stoul(value.substr(separator + 1))); }
+        catch (...) { return false; }
+    }
+    std::memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(port);
+    if (inet_pton(AF_INET, host.c_str(), &address.sin_addr) == 1) return true;
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* result = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || result == nullptr) return false;
+    address.sin_addr = reinterpret_cast<sockaddr_in*>(result->ai_addr)->sin_addr;
+    freeaddrinfo(result);
+    return true;
+}
+
+void set_query_id(std::vector<std::uint8_t>& packet, const std::uint16_t id) {
+    if (packet.size() < 2) return;
+    const std::uint16_t wire_id = htons(id);
+    std::memcpy(packet.data(), &wire_id, sizeof(wire_id));
 }
 
 } // namespace
@@ -52,7 +82,12 @@ bool DnsServer::setup_sockets(std::string& error) {
     epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
     udp_fd_ = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     tcp_fd_ = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (epoll_fd_ < 0 || udp_fd_ < 0 || tcp_fd_ < 0) {
+    completion_fd_ = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (!config_.upstreams.empty()) {
+        upstream_fd_ = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    }
+    if (epoll_fd_ < 0 || udp_fd_ < 0 || tcp_fd_ < 0 || completion_fd_ < 0 ||
+        (!config_.upstreams.empty() && upstream_fd_ < 0)) {
         error = "socket creation failed: " + std::string(std::strerror(errno));
         return false;
     }
@@ -80,7 +115,9 @@ bool DnsServer::setup_sockets(std::string& error) {
     signal_fd_ = signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
     if (signal_fd_ < 0 || !add_epoll(epoll_fd_, udp_fd_, EPOLLIN | EPOLLET) ||
         !add_epoll(epoll_fd_, tcp_fd_, EPOLLIN | EPOLLET) ||
-        !add_epoll(epoll_fd_, signal_fd_, EPOLLIN)) {
+        !add_epoll(epoll_fd_, signal_fd_, EPOLLIN) ||
+        !add_epoll(epoll_fd_, completion_fd_, EPOLLIN) ||
+        (upstream_fd_ >= 0 && !add_epoll(epoll_fd_, upstream_fd_, EPOLLIN | EPOLLET))) {
         error = "epoll registration failed: " + std::string(std::strerror(errno));
         return false;
     }
@@ -93,7 +130,7 @@ bool DnsServer::start(std::string& error) {
     ProcessorConfig processor_config;
     processor_config.upstreams = config_.upstreams;
     processor_ = std::make_unique<DnsProcessor>(std::move(zone), std::move(processor_config), config_.cache_size);
-    pool_ = std::make_unique<ThreadPool>(config_.threads);
+    pool_ = std::make_unique<ThreadPool>(config_.threads, config_.threads * 1024);
     if (!setup_sockets(error)) {
         stop();
         return false;
@@ -107,6 +144,8 @@ void DnsServer::stop() noexcept {
     if (!running_.exchange(false)) {
         pool_.reset();
         close_fd(signal_fd_);
+        close_fd(completion_fd_);
+        close_fd(upstream_fd_);
         close_fd(udp_fd_);
         close_fd(tcp_fd_);
         close_fd(epoll_fd_);
@@ -119,6 +158,8 @@ void DnsServer::stop() noexcept {
     clients_.clear();
     if (pool_) pool_->stop();
     close_fd(signal_fd_);
+    close_fd(completion_fd_);
+    close_fd(upstream_fd_);
     close_fd(udp_fd_);
     close_fd(tcp_fd_);
     close_fd(epoll_fd_);
@@ -135,15 +176,8 @@ void DnsServer::read_udp() {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             return;
         }
-        std::vector<std::uint8_t> request(buffer.begin(), buffer.begin() + received);
-        auto processor = processor_.get();
-        pool_->submit([processor, request = std::move(request), peer, peer_length, fd = udp_fd_]() {
-            const auto response = processor->process(request.data(), request.size(), false);
-            if (!response.empty()) {
-                sendto(fd, response.data(), response.size(), 0,
-                       reinterpret_cast<const sockaddr*>(&peer), peer_length);
-            }
-        });
+        route_request(std::vector<std::uint8_t>(buffer.begin(), buffer.begin() + received),
+                      false, &peer, peer_length, nullptr);
     }
 }
 
@@ -164,29 +198,184 @@ void DnsServer::accept_clients() {
 
 void DnsServer::dispatch_tcp_message(const std::shared_ptr<TcpClient>& client,
                                      std::vector<std::uint8_t> message) {
-    auto processor = processor_.get();
-    pool_->submit([this, processor, client, message = std::move(message)]() {
-        const auto response = processor->process(message.data(), message.size(), true);
-        if (response.size() > 65535 || client->fd < 0) return;
-        std::lock_guard<std::mutex> lock(client->mutex);
-        const std::uint16_t length = htons(static_cast<std::uint16_t>(response.size()));
-        const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
-        client->output.insert(client->output.end(), prefix, prefix + 2);
-        client->output.insert(client->output.end(), response.begin(), response.end());
-        while (!client->output.empty()) {
-            const ssize_t sent = send(client->fd, client->output.data(), client->output.size(), MSG_NOSIGNAL);
-            if (sent > 0) {
-                client->output.erase(client->output.begin(), client->output.begin() + sent);
-            } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                modify_epoll(epoll_fd_, client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
-                return;
-            } else {
-                shutdown(client->fd, SHUT_RDWR);
-                return;
-            }
+    route_request(std::move(message), true, nullptr, 0, client);
+}
+
+void DnsServer::route_request(std::vector<std::uint8_t> request, const bool tcp,
+                              const sockaddr_storage* peer, const socklen_t peer_length,
+                              const std::shared_ptr<TcpClient>& client) {
+    DnsQueryPlan plan;
+    std::string error;
+    processor_->prepare(request.data(), request.size(), tcp, plan, error);
+    if (plan.action == DnsQueryPlan::Action::Upstream) {
+        if (send_upstream(std::move(plan), peer, peer_length, client)) return;
+        plan.response = processor_->overload_response(request.data(), request.size(), tcp);
+    }
+    if (plan.response.empty()) return;
+    if (!tcp) {
+        sendto(udp_fd_, plan.response.data(), plan.response.size(), 0,
+               reinterpret_cast<const sockaddr*>(peer), peer_length);
+        return;
+    }
+    client->output.reserve(client->output.size() + 2 + plan.response.size());
+    const std::uint16_t length = htons(static_cast<std::uint16_t>(plan.response.size()));
+    const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
+    client->output.insert(client->output.end(), prefix, prefix + 2);
+    client->output.insert(client->output.end(), plan.response.begin(), plan.response.end());
+    modify_epoll(epoll_fd_, client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+}
+
+bool DnsServer::send_upstream(DnsQueryPlan plan, const sockaddr_storage* peer,
+                              const socklen_t peer_length,
+                              const std::shared_ptr<TcpClient>& client) {
+    if (upstream_fd_ < 0) return false;
+    std::uint16_t upstream_id = next_upstream_id_++;
+    while (upstream_id == 0 || pending_upstreams_.count(upstream_id) != 0) {
+        upstream_id = next_upstream_id_++;
+    }
+    set_query_id(plan.query, upstream_id);
+    bool sent = false;
+    for (const std::string& upstream : config_.upstreams) {
+        sockaddr_in address{};
+        if (!parse_upstream_address(upstream, address)) continue;
+        if (sendto(upstream_fd_, plan.query.data(), plan.query.size(), 0,
+                   reinterpret_cast<const sockaddr*>(&address), sizeof(address)) >= 0) {
+            sent = true;
         }
-        modify_epoll(epoll_fd_, client->fd, EPOLLIN | EPOLLET | EPOLLRDHUP);
-    });
+    }
+    if (!sent) return false;
+    PendingUpstream pending;
+    pending.upstream_id = upstream_id;
+    pending.plan = std::move(plan);
+    if (peer != nullptr) {
+        pending.peer = *peer;
+        pending.peer_length = peer_length;
+    }
+    pending.client = client;
+    pending.retries = 0;
+    pending.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    pending_upstreams_.emplace(upstream_id, std::move(pending));
+    return true;
+}
+
+void DnsServer::read_upstream() {
+    std::array<std::uint8_t, 65535> buffer{};
+    while (true) {
+        const ssize_t received = recvfrom(upstream_fd_, buffer.data(), buffer.size(), 0, nullptr, nullptr);
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (received <= 0) return;
+        if (received < 2) continue;
+        std::uint16_t wire_id = 0;
+        std::memcpy(&wire_id, buffer.data(), sizeof(wire_id));
+        const std::uint16_t upstream_id = ntohs(wire_id);
+        const auto found = pending_upstreams_.find(upstream_id);
+        if (found == pending_upstreams_.end()) continue;
+        PendingUpstream pending = std::move(found->second);
+        pending_upstreams_.erase(found);
+        const auto response = processor_->finish_upstream(pending.plan, buffer.data(),
+                                                           static_cast<std::size_t>(received));
+        if (response.empty()) continue;
+        if (pending.plan.tcp) {
+                if (pending.client == nullptr || clients_.find(pending.client->fd) == clients_.end()) continue;
+            const std::uint16_t length = htons(static_cast<std::uint16_t>(response.size()));
+            const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
+            pending.client->output.insert(pending.client->output.end(), prefix, prefix + 2);
+            pending.client->output.insert(pending.client->output.end(), response.begin(), response.end());
+            modify_epoll(epoll_fd_, pending.client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+        } else {
+            sendto(udp_fd_, response.data(), response.size(), 0,
+                   reinterpret_cast<const sockaddr*>(&pending.peer), pending.peer_length);
+        }
+    }
+}
+
+void DnsServer::expire_upstream_queries() {
+    const auto now = std::chrono::steady_clock::now();
+    for (auto iterator = pending_upstreams_.begin(); iterator != pending_upstreams_.end();) {
+        if (iterator->second.deadline > now) { ++iterator; continue; }
+        PendingUpstream& pending = iterator->second;
+        if (pending.retries < 1) {
+            ++pending.retries;
+            pending.deadline = now + std::chrono::seconds(2);
+            for (const std::string& upstream : config_.upstreams) {
+                sockaddr_in address{};
+                if (parse_upstream_address(upstream, address)) {
+                    sendto(upstream_fd_, pending.plan.query.data(), pending.plan.query.size(), 0,
+                           reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+                }
+            }
+            ++iterator;
+            continue;
+        }
+        const auto response = processor_->overload_response(pending.plan.query.data(),
+                                                             pending.plan.query.size(), pending.plan.tcp);
+        if (pending.plan.tcp && pending.client != nullptr) {
+            if (clients_.find(pending.client->fd) == clients_.end()) {
+                iterator = pending_upstreams_.erase(iterator);
+                continue;
+            }
+            std::vector<std::uint8_t> client_response = response;
+            set_query_id(client_response, pending.plan.original_id);
+            const std::uint16_t length = htons(static_cast<std::uint16_t>(response.size()));
+            const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
+            pending.client->output.insert(pending.client->output.end(), prefix, prefix + 2);
+            pending.client->output.insert(pending.client->output.end(), client_response.begin(), client_response.end());
+            modify_epoll(epoll_fd_, pending.client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+        } else if (!pending.plan.tcp) {
+            std::vector<std::uint8_t> client_response = response;
+            set_query_id(client_response, pending.plan.original_id);
+            sendto(udp_fd_, client_response.data(), client_response.size(), 0,
+                   reinterpret_cast<const sockaddr*>(&pending.peer), pending.peer_length);
+        }
+        iterator = pending_upstreams_.erase(iterator);
+    }
+}
+
+void DnsServer::drain_tcp_completions() {
+    std::uint64_t notification = 0;
+    while (read(completion_fd_, &notification, sizeof(notification)) > 0) {}
+    std::queue<TcpCompletion> completions;
+    {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        completions.swap(completions_);
+    }
+    while (!completions.empty()) {
+        TcpCompletion completion = std::move(completions.front());
+        completions.pop();
+        const int fd = completion.client->fd;
+        const auto found = clients_.find(fd);
+        if (found == clients_.end() || found->second != completion.client) continue;
+        const std::uint16_t length = htons(static_cast<std::uint16_t>(completion.response.size()));
+        const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
+        completion.client->output.insert(completion.client->output.end(), prefix, prefix + 2);
+        completion.client->output.insert(completion.client->output.end(),
+                                         completion.response.begin(), completion.response.end());
+        completion.client->last_activity = std::chrono::steady_clock::now();
+        modify_epoll(epoll_fd_, fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+    }
+}
+
+void DnsServer::flush_tcp_output(const std::shared_ptr<TcpClient>& client) {
+    while (client->output_offset < client->output.size()) {
+        const ssize_t sent = send(client->fd, client->output.data() + client->output_offset,
+                                  client->output.size() - client->output_offset, MSG_NOSIGNAL);
+        if (sent > 0) {
+            client->output_offset += static_cast<std::size_t>(sent);
+            continue;
+        }
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+        close_client(client->fd);
+        return;
+    }
+    if (client->output_offset == client->output.size()) {
+        client->output.clear();
+        client->output_offset = 0;
+    }
+    if (clients_.find(client->fd) != clients_.end()) {
+        modify_epoll(epoll_fd_, client->fd, client->output.empty()
+            ? EPOLLIN | EPOLLET | EPOLLRDHUP
+            : EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+    }
 }
 
 void DnsServer::read_tcp(const int fd) {
@@ -241,6 +430,8 @@ void DnsServer::event_loop() {
                 running_.store(false);
                 continue;
             }
+            if (fd == completion_fd_) { drain_tcp_completions(); continue; }
+            if (fd == upstream_fd_) { read_upstream(); continue; }
             if (fd == udp_fd_) { read_udp(); continue; }
             if (fd == tcp_fd_) { accept_clients(); continue; }
             if ((event & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) != 0) {
@@ -251,21 +442,12 @@ void DnsServer::event_loop() {
             if ((event & EPOLLOUT) != 0) {
                 const auto found = clients_.find(fd);
                 if (found != clients_.end()) {
-                    std::lock_guard<std::mutex> lock(found->second->mutex);
-                    while (!found->second->output.empty()) {
-                        const ssize_t sent = send(fd, found->second->output.data(),
-                                                  found->second->output.size(), MSG_NOSIGNAL);
-                        if (sent <= 0) break;
-                        found->second->output.erase(found->second->output.begin(),
-                                                   found->second->output.begin() + sent);
-                    }
-                    modify_epoll(epoll_fd_, fd, found->second->output.empty()
-                        ? EPOLLIN | EPOLLET | EPOLLRDHUP
-                        : EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+                    flush_tcp_output(found->second);
                 }
             }
         }
         const auto now = std::chrono::steady_clock::now();
+        expire_upstream_queries();
         for (auto iterator = clients_.begin(); iterator != clients_.end();) {
             if (now - iterator->second->last_activity > std::chrono::seconds(30)) {
                 const int fd = iterator->first;

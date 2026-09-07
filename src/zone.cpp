@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <array>
 #include <fstream>
+#include <algorithm>
 #include <sstream>
 
 namespace {
@@ -38,16 +39,22 @@ void append_u32(std::vector<std::uint8_t>& output, std::uint32_t value) {
     output.insert(output.end(), bytes, bytes + sizeof(wire));
 }
 
+std::string qualify_name(const std::string& value, const std::string& origin) {
+    if (value == "@") return normalize_dns_name(origin);
+    if (value.empty() || value == "." || value.back() == '.') return normalize_dns_name(value);
+    return normalize_dns_name(value + "." + origin);
+}
+
 bool make_record(const std::string& name, const std::string& type,
                  const std::vector<std::string>& fields, DnsResourceRecord& record,
-                 std::string& error) {
+                 std::string& error, const std::string& origin, const std::uint32_t ttl) {
     if (fields.empty()) {
         error = "missing record data";
         return false;
     }
-    record.name = normalize_dns_name(name);
+    record.name = qualify_name(name, origin);
     record.klass = 1;
-    record.ttl = 300;
+    record.ttl = ttl;
     record.rdata.clear();
     if (type == "A") {
         std::array<std::uint8_t, 4> address{};
@@ -67,14 +74,14 @@ bool make_record(const std::string& name, const std::string& type,
         record.rdata.assign(address.begin(), address.end());
     } else if (type == "CNAME" || type == "NS") {
         record.type = type == "CNAME" ? 5 : 2;
-        record.rdata = encode_dns_name(fields[0]);
+        record.rdata = encode_dns_name(qualify_name(fields[0], origin));
     } else if (type == "MX") {
         if (fields.size() < 2) { error = "MX needs preference and host"; return false; }
         std::uint16_t preference = 0;
         if (!parse_u16(fields[0], preference)) { error = "invalid MX preference"; return false; }
         record.type = 15;
         append_u16(record.rdata, preference);
-        const auto host = encode_dns_name(fields[1]);
+        const auto host = encode_dns_name(qualify_name(fields[1], origin));
         record.rdata.insert(record.rdata.end(), host.begin(), host.end());
     } else if (type == "TXT") {
         record.type = 16;
@@ -85,8 +92,8 @@ bool make_record(const std::string& name, const std::string& type,
     } else if (type == "SOA") {
         if (fields.size() < 7) { error = "SOA needs seven fields"; return false; }
         record.type = 6;
-        const auto primary = encode_dns_name(fields[0]);
-        const auto mailbox = encode_dns_name(fields[1]);
+        const auto primary = encode_dns_name(qualify_name(fields[0], origin));
+        const auto mailbox = encode_dns_name(qualify_name(fields[1], origin));
         record.rdata.insert(record.rdata.end(), primary.begin(), primary.end());
         record.rdata.insert(record.rdata.end(), mailbox.begin(), mailbox.end());
         for (std::size_t index = 2; index < 7; ++index) {
@@ -111,20 +118,64 @@ bool ZoneStore::load(const std::string& path, std::string& error) {
     }
     records_.clear();
     std::string line;
+    std::string logical_line;
+    std::string origin = ".";
+    std::uint32_t default_ttl = 300;
     std::size_t line_number = 0;
     while (std::getline(input, line)) {
         ++line_number;
-        const std::size_t comment = line.find('#');
+        const std::size_t hash_comment = line.find('#');
+        const std::size_t semicolon_comment = line.find(';');
+        const std::size_t comment = std::min(hash_comment, semicolon_comment);
         if (comment != std::string::npos) line.resize(comment);
-        std::istringstream stream(line);
-        std::string name;
-        std::string type;
-        if (!(stream >> name >> type)) continue;
-        std::vector<std::string> fields;
-        std::string field;
-        while (stream >> field) fields.push_back(field);
+        logical_line += " " + line;
+        const bool has_open = logical_line.find('(') != std::string::npos;
+        const bool has_close = logical_line.find(')') != std::string::npos;
+        if (has_open && !has_close) continue;
+        std::replace(logical_line.begin(), logical_line.end(), '(', ' ');
+        std::replace(logical_line.begin(), logical_line.end(), ')', ' ');
+        std::istringstream stream(logical_line);
+        logical_line.clear();
+        std::string directive;
+        if (!(stream >> directive)) continue;
+        if (directive == "$ORIGIN") {
+            if (!(stream >> origin)) { error = "invalid $ORIGIN"; return false; }
+            origin = normalize_dns_name(origin);
+            continue;
+        }
+        if (directive == "$TTL") {
+            std::string value;
+            if (!(stream >> value) || !parse_u32(value, default_ttl)) {
+                error = "invalid $TTL";
+                return false;
+            }
+            continue;
+        }
+        std::string name = directive;
+        std::string token;
+        std::vector<std::string> tokens;
+        while (stream >> token) tokens.push_back(token);
+        if (tokens.empty()) continue;
+        std::uint32_t record_ttl = default_ttl;
+        std::size_t index = 0;
+        std::uint32_t parsed_ttl = 0;
+        if (parse_u32(tokens[index], parsed_ttl)) {
+            record_ttl = parsed_ttl;
+            ++index;
+        }
+        if (index < tokens.size() && tokens[index] == "IN") ++index;
+        if (index >= tokens.size()) {
+            error = "missing record type";
+            return false;
+        }
+        const std::string type = tokens[index++];
+        std::vector<std::string> fields(tokens.begin() + static_cast<std::ptrdiff_t>(index), tokens.end());
+        if (type == "TXT" && fields.size() == 1 && fields[0].size() >= 2 &&
+            fields[0].front() == '"' && fields[0].back() == '"') {
+            fields[0] = fields[0].substr(1, fields[0].size() - 2);
+        }
         DnsResourceRecord record;
-        if (!make_record(name, type, fields, record, error)) {
+        if (!make_record(name, type, fields, record, error, origin, record_ttl)) {
             error = "zone line " + std::to_string(line_number) + ": " + error;
             return false;
         }

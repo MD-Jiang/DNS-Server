@@ -5,8 +5,9 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <fcntl.h>
 #include <netdb.h>
-#include <sys/select.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -88,43 +89,68 @@ std::vector<std::uint8_t> DnsProcessor::make_local_response(const DnsMessage& re
 std::vector<std::uint8_t> DnsProcessor::forward(const std::uint8_t* data, const std::size_t length,
                                                 const DnsMessage& request) const {
     if (config_.upstreams.empty()) return make_local_response(request, false);
-    std::vector<std::uint8_t> cached;
+    std::shared_ptr<const std::vector<std::uint8_t>> cached;
     if (!request.questions.empty() && cache_.get(cache_key(request.questions.front()), cached)) {
-        replace_id(cached, request.id);
-        return cached;
+        std::vector<std::uint8_t> response = *cached;
+        replace_id(response, request.id);
+        return response;
     }
-    const int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    const int socket_fd = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (socket_fd < 0) return {};
-    std::vector<std::uint8_t> result;
+    const int upstream_epoll = epoll_create1(EPOLL_CLOEXEC);
+    if (upstream_epoll < 0) {
+        close(socket_fd);
+        return {};
+    }
+    epoll_event event{};
+    event.events = EPOLLIN;
+    event.data.fd = socket_fd;
+    if (epoll_ctl(upstream_epoll, EPOLL_CTL_ADD, socket_fd, &event) != 0) {
+        close(upstream_epoll);
+        close(socket_fd);
+        return {};
+    }
+    std::vector<sockaddr_in> addresses;
+    addresses.reserve(config_.upstreams.size());
     for (const std::string& upstream : config_.upstreams) {
         sockaddr_in address{};
-        if (!parse_upstream(upstream, address)) continue;
-        for (std::uint32_t attempt = 0; attempt <= config_.retries; ++attempt) {
-            if (sendto(socket_fd, data, length, 0, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) continue;
-            fd_set readable;
-            FD_ZERO(&readable);
-            FD_SET(socket_fd, &readable);
-            timeval timeout{};
-            timeout.tv_sec = static_cast<long>(config_.timeout_ms / 1000);
-            timeout.tv_usec = static_cast<long>((config_.timeout_ms % 1000) * 1000);
-            if (select(socket_fd + 1, &readable, nullptr, nullptr, &timeout) <= 0) continue;
+        if (parse_upstream(upstream, address)) addresses.push_back(address);
+    }
+    if (addresses.empty()) {
+        close(upstream_epoll);
+        close(socket_fd);
+        return {};
+    }
+    for (std::uint32_t attempt = 0; attempt <= config_.retries; ++attempt) {
+        for (const sockaddr_in& address : addresses) {
+            sendto(socket_fd, data, length, 0,
+                   reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+        }
+        epoll_event ready{};
+        const int timeout = static_cast<int>(config_.timeout_ms);
+        if (epoll_wait(upstream_epoll, &ready, 1, timeout) <= 0 ||
+            (ready.events & EPOLLIN) == 0) continue;
+        while (true) {
             std::array<std::uint8_t, 65535> buffer{};
             const ssize_t received = recvfrom(socket_fd, buffer.data(), buffer.size(), 0, nullptr, nullptr);
-            if (received <= 0) continue;
+            if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+            if (received <= 0) break;
             DnsMessage upstream_response;
             std::string parse_error;
             if (!DnsMessage::parse(buffer.data(), static_cast<std::size_t>(received), upstream_response, parse_error) ||
                 upstream_response.id != request.id || !upstream_response.flags.qr) continue;
-            result.assign(buffer.begin(), buffer.begin() + received);
+            std::vector<std::uint8_t> result(buffer.begin(), buffer.begin() + received);
             if (!request.questions.empty()) {
                 const bool negative = upstream_response.flags.rcode == DnsRcode::NxDomain;
                 cache_.put(cache_key(request.questions.front()), result,
                            minimum_ttl(upstream_response), negative);
             }
+            close(upstream_epoll);
             close(socket_fd);
             return result;
         }
     }
+    close(upstream_epoll);
     close(socket_fd);
     DnsMessage failure;
     failure.id = request.id;
@@ -134,6 +160,76 @@ std::vector<std::uint8_t> DnsProcessor::forward(const std::uint8_t* data, const 
     failure.flags.rcode = DnsRcode::ServFail;
     failure.questions = request.questions;
     return failure.serialize(config_.udp_payload);
+}
+
+std::vector<std::uint8_t> DnsProcessor::overload_response(const std::uint8_t* data,
+                                                          const std::size_t length,
+                                                          const bool tcp) const {
+    DnsMessage request;
+    std::string error;
+    if (!DnsMessage::parse(data, length, request, error)) return {};
+    DnsMessage response;
+    response.id = request.id;
+    response.flags.qr = true;
+    response.flags.rd = request.flags.rd;
+    response.flags.ra = !config_.upstreams.empty();
+    response.flags.rcode = DnsRcode::ServFail;
+    response.questions = request.questions;
+    return response.serialize(tcp ? 65535 : config_.udp_payload);
+}
+
+bool DnsProcessor::prepare(const std::uint8_t* data, const std::size_t length,
+                           const bool tcp, DnsQueryPlan& plan, std::string& error) const {
+    plan = DnsQueryPlan{};
+    plan.tcp = tcp;
+    DnsMessage request;
+    if (!DnsMessage::parse(data, length, request, error) || request.flags.qr ||
+        request.flags.opcode != 0 || request.questions.empty()) {
+        plan.action = DnsQueryPlan::Action::Failure;
+        plan.response = overload_response(data, length, tcp);
+        return false;
+    }
+    plan.original_id = request.id;
+    plan.question = request.questions.front();
+    if (request.questions.size() > 1 || zone_.contains_name(plan.question.name)) {
+        plan.action = DnsQueryPlan::Action::Response;
+        plan.response = make_local_response(request, tcp);
+        return true;
+    }
+    std::shared_ptr<const std::vector<std::uint8_t>> cached;
+    if (!config_.upstreams.empty() && cache_.get(cache_key(plan.question), cached)) {
+        plan.action = DnsQueryPlan::Action::Response;
+        plan.response = *cached;
+        replace_id(plan.response, request.id);
+        return true;
+    }
+    if (config_.upstreams.empty()) {
+        plan.action = DnsQueryPlan::Action::Response;
+        plan.response = make_local_response(request, tcp);
+        return true;
+    }
+    plan.action = DnsQueryPlan::Action::Upstream;
+    plan.query.assign(data, data + length);
+    return true;
+}
+
+std::vector<std::uint8_t> DnsProcessor::finish_upstream(const DnsQueryPlan& plan,
+                                                        const std::uint8_t* data,
+                                                        const std::size_t length) const {
+    DnsMessage response;
+    std::string error;
+    std::uint16_t wire_id = 0;
+    if (length < 2) return {};
+    std::memcpy(&wire_id, data, sizeof(wire_id));
+    if (!DnsMessage::parse(data, length, response, error) ||
+        !response.flags.qr || response.id != ntohs(wire_id)) {
+        return {};
+    }
+    std::vector<std::uint8_t> output(data, data + length);
+    replace_id(output, plan.original_id);
+    cache_.put(cache_key(plan.question), output, minimum_ttl(response),
+               response.flags.rcode == DnsRcode::NxDomain);
+    return output;
 }
 
 std::vector<std::uint8_t> DnsProcessor::process(const std::uint8_t* data, const std::size_t length,

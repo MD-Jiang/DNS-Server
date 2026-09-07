@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <memory>
+#include <optional>
 
 struct ProcessorConfig {
     std::vector<std::string> upstreams;
@@ -16,11 +18,27 @@ struct ProcessorConfig {
     std::uint32_t retries = 1;
 };
 
+struct DnsQueryPlan {
+    enum class Action { Response, Upstream, Failure } action = Action::Failure;
+    std::uint16_t original_id = 0;
+    bool tcp = false;
+    std::vector<std::uint8_t> response;
+    std::vector<std::uint8_t> query;
+    DnsQuestion question;
+};
+
 class DnsProcessor {
 public:
     DnsProcessor(ZoneStore zone, ProcessorConfig config, std::size_t cache_size);
     std::vector<std::uint8_t> process(const std::uint8_t* data, std::size_t length,
                                       bool tcp) const;
+    std::vector<std::uint8_t> overload_response(const std::uint8_t* data,
+                                                std::size_t length, bool tcp) const;
+    bool prepare(const std::uint8_t* data, std::size_t length, bool tcp,
+                 DnsQueryPlan& plan, std::string& error) const;
+    std::vector<std::uint8_t> finish_upstream(const DnsQueryPlan& plan,
+                                              const std::uint8_t* data,
+                                              std::size_t length) const;
     bool load_error() const noexcept;
     const std::string& error() const noexcept;
 
