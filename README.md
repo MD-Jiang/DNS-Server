@@ -1,201 +1,105 @@
-# 🌐 DNS-Server-Cpp
+# DNS Server C++
 
-A lightweight, educational DNS (Domain Name System) server implementation in C++. This project is designed to help you understand the core concepts of DNS by building a basic server that can handle DNS queries and generate appropriate responses.
+一个不依赖第三方库的 C++17 DNS 服务器，支持本地权威解析、上游递归转发、TTL/LRU 缓存，以及 UDP/TCP DNS 传输。
 
-## 📋 Table of Contents
+## 功能
 
-- [🚀 Getting Started](#-getting-started)
-- [🛠️ Building the Project](#️-building-the-project)
-- [▶️ Running the Server](#️-running-the-server)
-- [🐞 Debugging](#-debugging)
-- [📁 Project Structure](#-project-structure)
-- [🤝 Contributing](#-contributing)
-- [📄 License](#-license)
+- RFC 1035 Header、Question 和 Answer/Authority/Additional 四区域解析。
+- DNS 域名长度检查、压缩指针解析、指针循环保护和多 Question。
+- A、AAAA、CNAME、MX、TXT、NS、SOA 区文件记录。
+- 未命中本地记录时，通过 UDP 向配置的上游 DNS 转发，并支持超时重试。
+- 正向和 NXDOMAIN 负缓存，TTL 到期和 LRU 淘汰。
+- Linux `epoll` 边缘触发事件循环、线程池、UDP 和带两字节长度前缀的 TCP。
+- `SIGINT`/`SIGTERM` 优雅停止和 TCP 空闲连接清理。
 
-## 🚀 Getting Started
+## 构建
 
-To get started with this project, ensure you have the following tools installed:
-
-- [CMake](https://cmake.org/download/) for build management.
-- A C++ compiler that supports C++23.
-- [vcpkg](https://github.com/microsoft/vcpkg) for managing dependencies.
-
-## 🛠️ Building the Project
-
-Follow these steps to build the project locally:
-
-1. **Clone the repository:**
-
-    ```bash
-    git clone https://github.com/yourusername/DNS-Server-Cpp.git
-    cd DNS-Server-Cpp
-    ```
-
-2. **Install dependencies using vcpkg:**
-
-    ```bash
-    ./vcpkg/bootstrap-vcpkg.sh
-    ./vcpkg/vcpkg install
-    ```
-
-3. **Compile the project:**
-
-    ```bash
-    ./your_program.sh
-    ```
-
-## ▶️ Running the Server
-
-To run the DNS server locally, execute:
+项目使用 C++17、CMake 和系统线程库，不需要 vcpkg 依赖。
 
 ```bash
-./build/server
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
 ```
 
-Upon successful execution, you should see output indicating that the server is running:
-    Logs from your program will appear here!
+编译选项包含 `-Wall -Wextra -pedantic`。
 
-You can test the DNS server using tools like dig or nslookup. For example, to query the server for an A record (IPv4 address) for a domain, use:
+## 启动
+
+```bash
+./build/server \
+  --port 2053 \
+  --zone-file config/zone.db \
+  --upstream 8.8.8.8:53,1.1.1.1:53 \
+  --threads 4 \
+  --cache-size 1024
+```
+
+参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `--port` | UDP/TCP 监听端口，默认 `2053` |
+| `--upstream` | 逗号分隔的上游 IPv4 地址，可带端口 |
+| `--zone-file` | 本地权威区文件路径 |
+| `--threads` | 工作线程数，默认 `4` |
+| `--cache-size` | 最大缓存条目数，默认 `1024` |
+
+## 区文件
+
+每行格式为：
+
+```text
+域名 类型 数据...
+```
+
+示例：
+
+```text
+example.com. A 8.8.8.8
+example.com. AAAA 2001:4860:4860::8888
+www.example.com. CNAME example.com.
+example.com. MX 10 mail.example.com.
+example.com. TXT dns-server-demo
+example.com. NS ns1.example.com.
+example.com. SOA ns1.example.com. hostmaster.example.com. 1 3600 600 86400 300
+```
+
+当前区文件记录使用默认 TTL 300 秒。
+
+## Docker Compose
+
+```bash
+docker compose up -d --build
+```
+
+Compose 使用本地已有的 Debian 12 Bookworm Python Slim 镜像作为构建基础，容器内端口为 `2053`：
+
+- UDP：主机 `2053` -> 容器 `2053`
+- TCP：主机 `15353` -> 容器 `2053`
+
+例如：
+
 ```bash
 dig @127.0.0.1 -p 2053 example.com A
+dig @127.0.0.1 -p 15353 example.com A +tcp
 ```
-## 🐞 Debugging
 
-To debug the DNS server, you can use debugging tools such as `gdb` or any IDE with C++ debugging support. To ensure that the executable contains debug symbols, you should configure your CMake project for debugging:
+停止服务：
 
-1. **Configure the build for debugging**:
-
-    ```bash
-    cmake -DCMAKE_BUILD_TYPE=Debug .
-    make
-    ```
-
-2. **Run the server with gdb**:
-
-    ```bash
-    gdb ./build/server
-    ```
-
-3. **Set breakpoints and run**:
-
-    In `gdb`, you can set breakpoints in your code and then run the server to analyze its behavior:
-
-    ```gdb
-    break main
-    run
-    ```
-
-This allows you to inspect variables, step through code, and identify where things might be going wrong if the server is not behaving as expected.
-
-## 📁 Project Structure
-
-```plaintext
-DNS-Server-Cpp/
-├── .codecrafters/
-│   ├── compile.sh
-│   ├── run.sh
-├── .gitattributes
-├── .gitignore
-├── build/
-│   ├── cmake_install.cmake
-│   ├── CMakeCache.txt
-│   ├── CMakeFiles/
-│   ├── Makefile
-│   ├── server
-│   └── vcpkg_installed/
-├── CMakeLists.txt
-├── codecrafters.yml
-├── README.md
-├── src/
-│   ├── dns_message.cpp
-│   ├── include/
-│   ├── server.cpp
-│   └── udp_server.cpp
-├── vcpkg-configuration.json
-├── vcpkg.json
-└── your_program.sh
+```bash
+docker compose down
 ```
-## Source Code
-- **src/**: Contains the source code for the DNS server.
-  - **dns_message.cpp**: Handles the parsing and serialization of DNS messages.
-  - **udp_server.cpp**: Implements the UDP server logic that handles incoming DNS queries.
-  - **server.cpp**: The main entry point for the DNS server.
 
-## Header Files
-- **include/**: Directory for header files.
+## 项目结构
 
-## Build and Scripts
-- **.codecrafters/**: Scripts used by Codecrafters to compile and run the program.
-  - **compile.sh**: Script to compile the program.
-  - **run.sh**: Script to run the program.
-- **build/**: Directory where the build artifacts are generated.
-  - **CMakeCache.txt**: Stores CMake configuration cache.
-  - **Makefile**: Makefile generated by CMake for building the project.
-  - **server**: The compiled DNS server binary.
-
-## Configuration Files
-- **CMakeLists.txt**: CMake configuration file that defines how the project should be built.
-- **codecrafters.yml**: Configuration file for Codecrafters platform.
-- **your_program.sh**: Script to compile and run the program locally.
-
-## 🤝 Contributing
-
-Contributions are welcome! If you'd like to improve the project, please fork the repository, make your changes, and submit a pull request. Here’s how you can get started:
-
-1. **Fork the repository**.
-2. **Create a new branch**:
-
-    ```bash
-    git checkout -b feature-branch
-    ```
-
-3. **Make your changes**.
-4. **Commit your changes**:
-
-    ```bash
-    git commit -m 'Add new feature'
-    ```
-
-5. **Push to the branch**:
-
-    ```bash
-    git push origin feature-branch
-    ```
-
-6. **Open a pull request** on GitHub.
-
-## 📄 License
-
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for more details.
-
-## 🔧 Prerequisites
-
-Before you begin, ensure you have met the following requirements:
-
-- You have installed [CMake](https://cmake.org/download/).
-- You have a C++ compiler that supports C++23.
-- You have installed [vcpkg](https://github.com/microsoft/vcpkg) for managing dependencies.
-
-## 📦 Installation
-
-Follow these steps to set up the project locally:
-
-1. **Clone the repository**:
-
-    ```bash
-    git clone https://github.com/yourusername/DNS-Server-Cpp.git
-    cd DNS-Server-Cpp
-    ```
-
-2. **Install dependencies using vcpkg**:
-
-    ```bash
-    ./vcpkg/bootstrap-vcpkg.sh
-    ./vcpkg/vcpkg install
-    ```
-
-3. **Build the project**:
-
-    ```bash
-    ./your_program.sh
-    ```
+```text
+src/dns_message.cpp       DNS 报文安全解析和序列化
+src/zone.cpp              区文件和本地记录查询
+src/dns_cache.cpp         TTL/LRU 缓存
+src/dns_processor.cpp     本地权威和上游转发
+src/dns_server.cpp        epoll、UDP、TCP 和优雅停止
+src/thread_pool.cpp       工作线程池
+tests/                    协议层单元测试
+config/zone.db            默认本地区文件
+```

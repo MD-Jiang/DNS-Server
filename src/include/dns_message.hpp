@@ -1,70 +1,60 @@
-#include <array>
+#pragma once
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-struct g_Question
-{
-    std::vector<std::string> qname;
-    std::uint16_t qtype = 0;
-    std::uint16_t qclass = 0;
+enum class DnsRcode : std::uint8_t {
+    NoError = 0,
+    FormError = 1,
+    ServFail = 2,
+    NxDomain = 3,
+    NotImplemented = 4,
+    Refused = 5
 };
 
-struct g_DNSFlags {
-    std::uint16_t qr : 1;
-    std::uint16_t opcode : 4;
-    std::uint16_t aa : 1;
-    std::uint16_t tc : 1;
-    std::uint16_t rd : 1;
-    std::uint16_t ra : 1;
-    std::uint16_t z : 3;
-    std::uint16_t rcode : 4;
+struct DnsFlags {
+    bool qr = false;
+    std::uint8_t opcode = 0;
+    bool aa = false;
+    bool tc = false;
+    bool rd = false;
+    bool ra = false;
+    std::uint8_t z = 0;
+    DnsRcode rcode = DnsRcode::NoError;
 
-    // Function to convert the flag struct to a 16-bit value
-    std::uint16_t toUint16() const {
-         return (qr << 15) | (opcode << 11) | (aa << 10) | 
-               (tc << 9) | (rd << 8) | (ra << 7) | (z << 4) | rcode;
-    }
-
-    // Function to set flags from a 16-bit value
-    void fromUint16(std::uint16_t value) {
-        qr = (value >> 15) & 0x01;
-        opcode = (value >> 11) & 0x0F;
-        aa = (value >> 10) & 0x01;
-        tc = (value >> 9) & 0x01;
-        rd = (value >> 8) & 0x01;
-        ra = (value >> 7) & 0x01;
-        z = (value >> 4) & 0x07;
-        rcode = value & 0x0F;
-    }
+    static DnsFlags from_wire(std::uint16_t value) noexcept;
+    std::uint16_t to_wire() const noexcept;
 };
 
-class Header {
-    public:
-
-    std::uint16_t tran_id;
-    g_DNSFlags flags;
-    std::uint16_t question_count;
-    std::uint16_t answer_count;
-    std::uint16_t authority_count;
-    std::uint16_t additional_count;
-    g_Question question;
-    std::uint32_t answer_ttl = 60;
-    std::array<std::uint8_t, 4> answer_address{8, 8, 8, 8};
-
-    // Constructor
-    Header();
-
-    // Function to set up a standard question with a given question ID
-    void setStandardQery(std::uint16_t query_id);
-
-    // Function to parse a DNS message from a buffer
-    void parse(const std::uint8_t *buffer);
-
-    // Function to serialize the DNS header into a buffer
-    std::size_t serialize(std::uint8_t *buffer) const;
-
-    // Function to print the DNS header for debugging purposes
-    void print(std::uint8_t *buffer) const;
+struct DnsQuestion {
+    std::string name;
+    std::uint16_t type = 1;
+    std::uint16_t klass = 1;
 };
+
+struct DnsResourceRecord {
+    std::string name;
+    std::uint16_t type = 1;
+    std::uint16_t klass = 1;
+    std::uint32_t ttl = 0;
+    std::vector<std::uint8_t> rdata;
+};
+
+struct DnsMessage {
+    std::uint16_t id = 0;
+    DnsFlags flags;
+    std::vector<DnsQuestion> questions;
+    std::vector<DnsResourceRecord> answers;
+    std::vector<DnsResourceRecord> authorities;
+    std::vector<DnsResourceRecord> additionals;
+
+    static bool parse(const std::uint8_t* data, std::size_t length,
+                      DnsMessage& message, std::string& error);
+    std::vector<std::uint8_t> serialize(std::size_t max_size = 65535,
+                                        bool* truncated = nullptr) const;
+};
+
+std::string normalize_dns_name(const std::string& name);
+std::vector<std::uint8_t> encode_dns_name(const std::string& name);

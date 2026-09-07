@@ -1,0 +1,10 @@
+# name type rdata...
+example.com. A 8.8.8.8
+example.com. AAAA 2001:4860:4860::8888
+www.example.com. CNAME example.com.
+example.com. MX 10 mail.example.com.
+example.com. TXT dns-server-demo
+example.com. NS ns1.example.com.
+example.com. SOA ns1.example.com. hostmaster.example.com. 1 3600 600 86400 300
+ns1.example.com. A 192.0.2.53
+mail.example.com. A 192.0.2.25

@@ -5,6 +5,18 @@ services:
       dockerfile: Dockerfile
     image: dns-server:latest
     container_name: dns-server
+    command:
+      - "--port"
+      - "2053"
+      - "--zone-file"
+      - "/app/config/zone.db"
+      - "--upstream"
+      - "8.8.8.8:53,1.1.1.1:53"
+      - "--threads"
+      - "4"
+      - "--cache-size"
+      - "1024"
     ports:
       - "2053:2053/udp"
+      - "15353:2053/tcp"
     restart: unless-stopped
