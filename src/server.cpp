@@ -2,7 +2,6 @@
 #include "dns_server.hpp"
 
 #include <cstdlib>
-#include <iostream>
 #include <sstream>
 
 namespace {
