@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class ZoneStore {
@@ -18,4 +19,5 @@ private:
     bool load_file(const std::string& path, std::string& error, std::string& origin,
                    std::uint32_t& default_ttl, std::size_t depth);
     std::unordered_map<std::string, std::vector<DnsResourceRecord>> records_;
+    std::unordered_set<std::string> domain_names_;
 };

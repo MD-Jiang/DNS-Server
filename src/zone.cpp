@@ -194,6 +194,7 @@ bool make_record(const std::string& name, const std::string& type,
 
 bool ZoneStore::load(const std::string& path, std::string& error) {
     records_.clear();
+    domain_names_.clear();
     std::string origin = ".";
     std::uint32_t default_ttl = 300;
     return load_file(path, error, origin, default_ttl, 0);
@@ -295,6 +296,7 @@ bool ZoneStore::load_file(const std::string& path, std::string& error, std::stri
             error = "zone line " + std::to_string(line_number) + ": " + error;
             return false;
         }
+        domain_names_.insert(record.name);
         records_[record.name + "\x1f" + std::to_string(record.type)].push_back(std::move(record));
     }
     return true;
@@ -313,12 +315,5 @@ std::vector<DnsResourceRecord> ZoneStore::lookup(const std::string& name, const 
 }
 
 bool ZoneStore::contains_name(const std::string& name) const {
-    const std::string prefix = normalize_dns_name(name) + "\x1f";
-    for (const auto& entry : records_) {
-        if (entry.first.compare(0, prefix.size(), prefix) == 0 &&
-            entry.first.find('\x1f', prefix.size()) == std::string::npos) {
-            return true;
-        }
-    }
-    return false;
+    return domain_names_.find(normalize_dns_name(name)) != domain_names_.end();
 }
