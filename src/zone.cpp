@@ -2,9 +2,10 @@
 
 #include <arpa/inet.h>
 #include <array>
+#include <cctype>
 #include <fstream>
 #include <algorithm>
-#include <sstream>
+#include <filesystem>
 
 namespace {
 
@@ -43,6 +44,85 @@ std::string qualify_name(const std::string& value, const std::string& origin) {
     if (value == "@") return normalize_dns_name(origin);
     if (value.empty() || value == "." || value.back() == '.') return normalize_dns_name(value);
     return normalize_dns_name(value + "." + origin);
+}
+
+std::string strip_zone_comment(const std::string& line) {
+    bool quoted = false;
+    bool escaped = false;
+    for (std::size_t index = 0; index < line.size(); ++index) {
+        const char character = line[index];
+        if (escaped) {
+            escaped = false;
+            continue;
+        }
+        if (character == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (character == '"') {
+            quoted = !quoted;
+            continue;
+        }
+        if (!quoted && (character == ';' || character == '#')) return line.substr(0, index);
+    }
+    return line;
+}
+
+bool tokenize_zone_line(const std::string& line, std::vector<std::string>& tokens,
+                        std::string& error) {
+    tokens.clear();
+    std::string token;
+    bool quoted = false;
+    bool escaped = false;
+    auto flush = [&]() {
+        if (!token.empty()) {
+            tokens.push_back(std::move(token));
+            token.clear();
+        }
+    };
+    for (const char character : line) {
+        if (escaped) {
+            token.push_back('\\');
+            token.push_back(character);
+            escaped = false;
+        } else if (character == '\\') {
+            escaped = true;
+        } else if (character == '"') {
+            quoted = !quoted;
+        } else if (!quoted && (std::isspace(static_cast<unsigned char>(character)) ||
+                               character == '(' || character == ')')) {
+            flush();
+        } else {
+            token.push_back(character);
+        }
+    }
+    if (escaped || quoted) {
+        error = "unterminated quoted or escaped zone field";
+        return false;
+    }
+    flush();
+    return true;
+}
+
+std::string decode_txt(const std::string& value) {
+    std::string output;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] != '\\' || index + 1 >= value.size()) {
+            output.push_back(value[index]);
+            continue;
+        }
+        if (index + 3 < value.size() && std::isdigit(static_cast<unsigned char>(value[index + 1])) &&
+            std::isdigit(static_cast<unsigned char>(value[index + 2])) &&
+            std::isdigit(static_cast<unsigned char>(value[index + 3]))) {
+            const int number = (value[index + 1] - '0') * 100 +
+                               (value[index + 2] - '0') * 10 + value[index + 3] - '0';
+            output.push_back(static_cast<char>(number & 0xff));
+            index += 3;
+        } else {
+            output.push_back(value[++index]);
+        }
+    }
+    return output;
 }
 
 bool make_record(const std::string& name, const std::string& type,
@@ -85,10 +165,12 @@ bool make_record(const std::string& name, const std::string& type,
         record.rdata.insert(record.rdata.end(), host.begin(), host.end());
     } else if (type == "TXT") {
         record.type = 16;
-        const std::string text = fields[0];
-        if (text.size() > 255) { error = "TXT string is too long"; return false; }
-        record.rdata.push_back(static_cast<std::uint8_t>(text.size()));
-        record.rdata.insert(record.rdata.end(), text.begin(), text.end());
+        for (const std::string& field : fields) {
+            const std::string text = decode_txt(field);
+            if (text.size() > 255) { error = "TXT string is too long"; return false; }
+            record.rdata.push_back(static_cast<std::uint8_t>(text.size()));
+            record.rdata.insert(record.rdata.end(), text.begin(), text.end());
+        }
     } else if (type == "SOA") {
         if (fields.size() < 7) { error = "SOA needs seven fields"; return false; }
         record.type = 6;
@@ -111,51 +193,89 @@ bool make_record(const std::string& name, const std::string& type,
 } // namespace
 
 bool ZoneStore::load(const std::string& path, std::string& error) {
+    records_.clear();
+    std::string origin = ".";
+    std::uint32_t default_ttl = 300;
+    return load_file(path, error, origin, default_ttl, 0);
+}
+
+bool ZoneStore::load_file(const std::string& path, std::string& error, std::string& origin,
+                          std::uint32_t& default_ttl, const std::size_t depth) {
+    if (depth > 16) {
+        error = "zone $INCLUDE nesting is too deep";
+        return false;
+    }
     std::ifstream input(path);
     if (!input) {
         error = "cannot open zone file: " + path;
         return false;
     }
-    records_.clear();
     std::string line;
     std::string logical_line;
-    std::string origin = ".";
-    std::uint32_t default_ttl = 300;
     std::size_t line_number = 0;
+    int parenthesis_depth = 0;
     while (std::getline(input, line)) {
         ++line_number;
-        const std::size_t hash_comment = line.find('#');
-        const std::size_t semicolon_comment = line.find(';');
-        const std::size_t comment = std::min(hash_comment, semicolon_comment);
-        if (comment != std::string::npos) line.resize(comment);
+        line = strip_zone_comment(line);
+        bool quoted = false;
+        bool escaped = false;
+        for (const char character : line) {
+            if (escaped) { escaped = false; continue; }
+            if (character == '\\') { escaped = true; continue; }
+            if (character == '"') { quoted = !quoted; continue; }
+            if (!quoted && character == '(') ++parenthesis_depth;
+            if (!quoted && character == ')') --parenthesis_depth;
+            if (parenthesis_depth < 0) {
+                error = "zone line " + std::to_string(line_number) + ": unexpected ')'";
+                return false;
+            }
+        }
         logical_line += " " + line;
-        const bool has_open = logical_line.find('(') != std::string::npos;
-        const bool has_close = logical_line.find(')') != std::string::npos;
-        if (has_open && !has_close) continue;
-        std::replace(logical_line.begin(), logical_line.end(), '(', ' ');
-        std::replace(logical_line.begin(), logical_line.end(), ')', ' ');
-        std::istringstream stream(logical_line);
+        if (parenthesis_depth != 0) continue;
+        std::vector<std::string> tokens;
+        std::string tokenize_error;
+        if (!tokenize_zone_line(logical_line, tokens, tokenize_error)) {
+            error = "zone line " + std::to_string(line_number) + ": " + tokenize_error;
+            return false;
+        }
         logical_line.clear();
-        std::string directive;
-        if (!(stream >> directive)) continue;
+        if (tokens.empty()) continue;
+        const std::string& directive = tokens.front();
         if (directive == "$ORIGIN") {
-            if (!(stream >> origin)) { error = "invalid $ORIGIN"; return false; }
-            origin = normalize_dns_name(origin);
+            if (tokens.size() != 2) {
+                error = "zone line " + std::to_string(line_number) + ": invalid $ORIGIN";
+                return false;
+            }
+            origin = normalize_dns_name(tokens[1]);
             continue;
         }
         if (directive == "$TTL") {
-            std::string value;
-            if (!(stream >> value) || !parse_u32(value, default_ttl)) {
-                error = "invalid $TTL";
+            if (tokens.size() != 2 || !parse_u32(tokens[1], default_ttl)) {
+                error = "zone line " + std::to_string(line_number) + ": invalid $TTL";
                 return false;
             }
             continue;
         }
-        std::string name = directive;
-        std::string token;
-        std::vector<std::string> tokens;
-        while (stream >> token) tokens.push_back(token);
-        if (tokens.empty()) continue;
+        if (directive == "$INCLUDE") {
+            if (tokens.size() < 2 || tokens.size() > 3) {
+                error = "zone line " + std::to_string(line_number) + ": invalid $INCLUDE";
+                return false;
+            }
+            std::string include_origin = tokens.size() == 3 ? normalize_dns_name(tokens[2]) : origin;
+            const std::filesystem::path include_path =
+                std::filesystem::path(path).parent_path() / tokens[1];
+            if (!load_file(include_path.lexically_normal().string(), error, include_origin,
+                           default_ttl, depth + 1)) {
+                return false;
+            }
+            continue;
+        }
+        if (tokens.size() < 2) {
+            error = "zone line " + std::to_string(line_number) + ": missing record fields";
+            return false;
+        }
+        std::string name = tokens.front();
+        tokens.erase(tokens.begin());
         std::uint32_t record_ttl = default_ttl;
         std::size_t index = 0;
         std::uint32_t parsed_ttl = 0;
@@ -170,10 +290,6 @@ bool ZoneStore::load(const std::string& path, std::string& error) {
         }
         const std::string type = tokens[index++];
         std::vector<std::string> fields(tokens.begin() + static_cast<std::ptrdiff_t>(index), tokens.end());
-        if (type == "TXT" && fields.size() == 1 && fields[0].size() >= 2 &&
-            fields[0].front() == '"' && fields[0].back() == '"') {
-            fields[0] = fields[0].substr(1, fields[0].size() - 2);
-        }
         DnsResourceRecord record;
         if (!make_record(name, type, fields, record, error, origin, record_ttl)) {
             error = "zone line " + std::to_string(line_number) + ": " + error;
@@ -199,7 +315,10 @@ std::vector<DnsResourceRecord> ZoneStore::lookup(const std::string& name, const 
 bool ZoneStore::contains_name(const std::string& name) const {
     const std::string prefix = normalize_dns_name(name) + "\x1f";
     for (const auto& entry : records_) {
-        if (entry.first.compare(0, prefix.size(), prefix) == 0) return true;
+        if (entry.first.compare(0, prefix.size(), prefix) == 0 &&
+            entry.first.find('\x1f', prefix.size()) == std::string::npos) {
+            return true;
+        }
     }
     return false;
 }

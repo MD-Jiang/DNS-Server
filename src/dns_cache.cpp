@@ -26,9 +26,13 @@ bool DnsCache::get(const std::string& key,
                    std::shared_ptr<const std::vector<std::uint8_t>>& response) {
     Shard& shard = *shards_[std::hash<std::string>{}(key) % shards_.size()];
     std::lock_guard<std::mutex> lock(shard.mutex);
-    evict_expired_locked(shard);
     const auto found = shard.index.find(key);
     if (found == shard.index.end()) return false;
+    if (found->second->value.expires <= std::chrono::steady_clock::now()) {
+        shard.lru.erase(found->second);
+        shard.index.erase(found);
+        return false;
+    }
     shard.lru.splice(shard.lru.begin(), shard.lru, found->second);
     response = found->second->value.response;
     return true;
@@ -55,5 +59,12 @@ void DnsCache::put(std::string key, std::vector<std::uint8_t> response,
     while (shard.lru.size() > shard_capacity) {
         shard.index.erase(shard.lru.back().key);
         shard.lru.pop_back();
+    }
+}
+
+void DnsCache::cleanup_expired() {
+    for (const std::unique_ptr<Shard>& shard : shards_) {
+        std::lock_guard<std::mutex> lock(shard->mutex);
+        evict_expired_locked(*shard);
     }
 }

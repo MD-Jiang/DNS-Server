@@ -42,8 +42,15 @@ private:
     };
 
     struct TcpCompletion {
-        std::shared_ptr<TcpClient> client;
+        enum class Kind { Response, UpstreamQuery };
+
+        Kind kind = Kind::Response;
+        bool tcp = false;
+        std::weak_ptr<TcpClient> client;
+        sockaddr_storage peer{};
+        socklen_t peer_length = 0;
         std::vector<std::uint8_t> response;
+        DnsQueryPlan plan;
     };
 
     bool setup_sockets(std::string& error);
@@ -54,6 +61,8 @@ private:
     void close_client(int fd);
     void dispatch_tcp_message(const std::shared_ptr<TcpClient>& client, std::vector<std::uint8_t> message);
     void drain_tcp_completions();
+    void post_completion(TcpCompletion completion);
+    void send_response(const TcpCompletion& completion);
     void flush_tcp_output(const std::shared_ptr<TcpClient>& client);
     void route_request(std::vector<std::uint8_t> request, bool tcp,
                        const sockaddr_storage* peer, socklen_t peer_length,
@@ -82,12 +91,13 @@ private:
         DnsQueryPlan plan;
         sockaddr_storage peer{};
         socklen_t peer_length = 0;
-        std::shared_ptr<TcpClient> client;
+        std::weak_ptr<TcpClient> client;
         std::chrono::steady_clock::time_point deadline;
         std::uint32_t retries = 0;
     };
     std::unordered_map<std::uint16_t, PendingUpstream> pending_upstreams_;
     std::uint16_t next_upstream_id_ = 1;
+    std::size_t next_upstream_index_ = 0;
     std::mutex completion_mutex_;
     std::queue<TcpCompletion> completions_;
 };

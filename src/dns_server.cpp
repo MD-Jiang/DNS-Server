@@ -1,4 +1,5 @@
 #include "dns_server.hpp"
+#include "upstream_address.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -17,34 +18,14 @@
 
 namespace {
 
+constexpr std::size_t max_tcp_output_size = 1024 * 1024;
+constexpr std::size_t max_tcp_input_size = 1024 * 1024;
+
 void close_fd(int& fd) {
     if (fd >= 0) {
         close(fd);
         fd = -1;
     }
-}
-
-bool parse_upstream_address(const std::string& value, sockaddr_in& address) {
-    std::string host = value;
-    std::uint16_t port = 53;
-    const std::size_t separator = value.rfind(':');
-    if (separator != std::string::npos && value.find(':') == separator) {
-        host = value.substr(0, separator);
-        try { port = static_cast<std::uint16_t>(std::stoul(value.substr(separator + 1))); }
-        catch (...) { return false; }
-    }
-    std::memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-    if (inet_pton(AF_INET, host.c_str(), &address.sin_addr) == 1) return true;
-    addrinfo hints{};
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    addrinfo* result = nullptr;
-    if (getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0 || result == nullptr) return false;
-    address.sin_addr = reinterpret_cast<sockaddr_in*>(result->ai_addr)->sin_addr;
-    freeaddrinfo(result);
-    return true;
 }
 
 void set_query_id(std::vector<std::uint8_t>& packet, const std::uint16_t id) {
@@ -204,25 +185,41 @@ void DnsServer::dispatch_tcp_message(const std::shared_ptr<TcpClient>& client,
 void DnsServer::route_request(std::vector<std::uint8_t> request, const bool tcp,
                               const sockaddr_storage* peer, const socklen_t peer_length,
                               const std::shared_ptr<TcpClient>& client) {
-    DnsQueryPlan plan;
-    std::string error;
-    processor_->prepare(request.data(), request.size(), tcp, plan, error);
-    if (plan.action == DnsQueryPlan::Action::Upstream) {
-        if (send_upstream(std::move(plan), peer, peer_length, client)) return;
-        plan.response = processor_->overload_response(request.data(), request.size(), tcp);
+    sockaddr_storage request_peer{};
+    if (peer != nullptr) request_peer = *peer;
+    const std::weak_ptr<TcpClient> weak_client = client;
+    auto request_data = std::make_shared<const std::vector<std::uint8_t>>(std::move(request));
+    const bool submitted = pool_->submit([this, request_data, tcp,
+                                           request_peer, peer_length, weak_client]() mutable {
+        DnsQueryPlan plan;
+        std::string error;
+        processor_->prepare(request_data->data(), request_data->size(), tcp, plan, error);
+        TcpCompletion completion;
+        completion.tcp = tcp;
+        completion.peer = request_peer;
+        completion.peer_length = peer_length;
+        completion.client = weak_client;
+        if (plan.action == DnsQueryPlan::Action::Upstream) {
+            completion.kind = TcpCompletion::Kind::UpstreamQuery;
+            completion.plan = std::move(plan);
+        } else {
+            completion.response = std::move(plan.response);
+        }
+        if (!completion.response.empty() || completion.kind == TcpCompletion::Kind::UpstreamQuery) {
+            post_completion(std::move(completion));
+        }
+    });
+    if (!submitted) {
+        const auto response = processor_->overload_response(request_data->data(), request_data->size(), tcp);
+        if (response.empty()) return;
+        TcpCompletion completion;
+        completion.tcp = tcp;
+        completion.peer = request_peer;
+        completion.peer_length = peer_length;
+        completion.client = weak_client;
+        completion.response = response;
+        send_response(completion);
     }
-    if (plan.response.empty()) return;
-    if (!tcp) {
-        sendto(udp_fd_, plan.response.data(), plan.response.size(), 0,
-               reinterpret_cast<const sockaddr*>(peer), peer_length);
-        return;
-    }
-    client->output.reserve(client->output.size() + 2 + plan.response.size());
-    const std::uint16_t length = htons(static_cast<std::uint16_t>(plan.response.size()));
-    const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
-    client->output.insert(client->output.end(), prefix, prefix + 2);
-    client->output.insert(client->output.end(), plan.response.begin(), plan.response.end());
-    modify_epoll(epoll_fd_, client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
 }
 
 bool DnsServer::send_upstream(DnsQueryPlan plan, const sockaddr_storage* peer,
@@ -235,12 +232,15 @@ bool DnsServer::send_upstream(DnsQueryPlan plan, const sockaddr_storage* peer,
     }
     set_query_id(plan.query, upstream_id);
     bool sent = false;
-    for (const std::string& upstream : config_.upstreams) {
+    for (std::size_t offset = 0; offset < config_.upstreams.size(); ++offset) {
+        const std::size_t index = (next_upstream_index_ + offset) % config_.upstreams.size();
         sockaddr_in address{};
-        if (!parse_upstream_address(upstream, address)) continue;
+        if (!parse_upstream_address(config_.upstreams[index], address)) continue;
         if (sendto(upstream_fd_, plan.query.data(), plan.query.size(), 0,
                    reinterpret_cast<const sockaddr*>(&address), sizeof(address)) >= 0) {
             sent = true;
+            next_upstream_index_ = (index + 1) % config_.upstreams.size();
+            break;
         }
     }
     if (!sent) return false;
@@ -272,19 +272,32 @@ void DnsServer::read_upstream() {
         if (found == pending_upstreams_.end()) continue;
         PendingUpstream pending = std::move(found->second);
         pending_upstreams_.erase(found);
-        const auto response = processor_->finish_upstream(pending.plan, buffer.data(),
-                                                           static_cast<std::size_t>(received));
-        if (response.empty()) continue;
-        if (pending.plan.tcp) {
-                if (pending.client == nullptr || clients_.find(pending.client->fd) == clients_.end()) continue;
-            const std::uint16_t length = htons(static_cast<std::uint16_t>(response.size()));
-            const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
-            pending.client->output.insert(pending.client->output.end(), prefix, prefix + 2);
-            pending.client->output.insert(pending.client->output.end(), response.begin(), response.end());
-            modify_epoll(epoll_fd_, pending.client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
-        } else {
-            sendto(udp_fd_, response.data(), response.size(), 0,
-                   reinterpret_cast<const sockaddr*>(&pending.peer), pending.peer_length);
+        const std::weak_ptr<TcpClient> weak_client = pending.client;
+        const DnsQueryPlan plan = pending.plan;
+        const sockaddr_storage peer = pending.peer;
+        const socklen_t peer_length = pending.peer_length;
+        std::vector<std::uint8_t> packet(buffer.begin(), buffer.begin() + received);
+        if (!pool_->submit([this, plan, packet = std::move(packet), weak_client,
+                            peer, peer_length]() mutable {
+                const auto response = processor_->finish_upstream(plan, packet.data(), packet.size());
+                if (response.empty()) return;
+                TcpCompletion completion;
+                completion.tcp = plan.tcp;
+                completion.client = weak_client;
+                completion.peer = peer;
+                completion.peer_length = peer_length;
+                completion.response = response;
+                post_completion(std::move(completion));
+            })) {
+                auto response = processor_->overload_response(plan.query.data(), plan.query.size(), plan.tcp);
+                set_query_id(response, plan.original_id);
+            TcpCompletion completion;
+            completion.tcp = plan.tcp;
+            completion.client = weak_client;
+            completion.peer = peer;
+            completion.peer_length = peer_length;
+            completion.response = response;
+            send_response(completion);
         }
     }
 }
@@ -297,37 +310,80 @@ void DnsServer::expire_upstream_queries() {
         if (pending.retries < 1) {
             ++pending.retries;
             pending.deadline = now + std::chrono::seconds(2);
-            for (const std::string& upstream : config_.upstreams) {
+            for (std::size_t offset = 0; offset < config_.upstreams.size(); ++offset) {
+                const std::size_t index = (next_upstream_index_ + offset) % config_.upstreams.size();
                 sockaddr_in address{};
-                if (parse_upstream_address(upstream, address)) {
+                if (parse_upstream_address(config_.upstreams[index], address) &&
                     sendto(upstream_fd_, pending.plan.query.data(), pending.plan.query.size(), 0,
-                           reinterpret_cast<const sockaddr*>(&address), sizeof(address));
+                           reinterpret_cast<const sockaddr*>(&address), sizeof(address)) >= 0) {
+                    next_upstream_index_ = (index + 1) % config_.upstreams.size();
+                    break;
                 }
             }
             ++iterator;
             continue;
         }
-        const auto response = processor_->overload_response(pending.plan.query.data(),
-                                                             pending.plan.query.size(), pending.plan.tcp);
-        if (pending.plan.tcp && pending.client != nullptr) {
-            if (clients_.find(pending.client->fd) == clients_.end()) {
-                iterator = pending_upstreams_.erase(iterator);
-                continue;
-            }
-            std::vector<std::uint8_t> client_response = response;
-            set_query_id(client_response, pending.plan.original_id);
-            const std::uint16_t length = htons(static_cast<std::uint16_t>(response.size()));
-            const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
-            pending.client->output.insert(pending.client->output.end(), prefix, prefix + 2);
-            pending.client->output.insert(pending.client->output.end(), client_response.begin(), client_response.end());
-            modify_epoll(epoll_fd_, pending.client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
-        } else if (!pending.plan.tcp) {
-            std::vector<std::uint8_t> client_response = response;
-            set_query_id(client_response, pending.plan.original_id);
-            sendto(udp_fd_, client_response.data(), client_response.size(), 0,
-                   reinterpret_cast<const sockaddr*>(&pending.peer), pending.peer_length);
+        const DnsQueryPlan plan = pending.plan;
+        const std::weak_ptr<TcpClient> weak_client = pending.client;
+        const sockaddr_storage peer = pending.peer;
+        const socklen_t peer_length = pending.peer_length;
+        if (!pool_->submit([this, plan, weak_client, peer, peer_length]() {
+                auto response = processor_->overload_response(plan.query.data(), plan.query.size(), plan.tcp);
+                set_query_id(response, plan.original_id);
+                if (response.empty()) return;
+                TcpCompletion completion;
+                completion.tcp = plan.tcp;
+                completion.client = weak_client;
+                completion.peer = peer;
+                completion.peer_length = peer_length;
+                completion.response = std::move(response);
+                post_completion(std::move(completion));
+            })) {
+            auto response = processor_->overload_response(plan.query.data(), plan.query.size(), plan.tcp);
+            set_query_id(response, plan.original_id);
+            TcpCompletion completion;
+            completion.tcp = plan.tcp;
+            completion.client = weak_client;
+            completion.peer = peer;
+            completion.peer_length = peer_length;
+            completion.response = std::move(response);
+            send_response(completion);
         }
         iterator = pending_upstreams_.erase(iterator);
+    }
+}
+
+void DnsServer::post_completion(TcpCompletion completion) {
+    {
+        std::lock_guard<std::mutex> lock(completion_mutex_);
+        completions_.push(std::move(completion));
+    }
+    const std::uint64_t notification = 1;
+    (void)write(completion_fd_, &notification, sizeof(notification));
+}
+
+void DnsServer::send_response(const TcpCompletion& completion) {
+    if (completion.response.empty()) return;
+    if (auto client = completion.client.lock()) {
+        const auto found = clients_.find(client->fd);
+        if (found == clients_.end() || found->second != client) return;
+        if (completion.response.size() > 65535 ||
+            client->output.size() - client->output_offset + 2 + completion.response.size() >
+                max_tcp_output_size) {
+            close_client(client->fd);
+            return;
+        }
+        const std::uint16_t length = htons(static_cast<std::uint16_t>(completion.response.size()));
+        const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
+        client->output.insert(client->output.end(), prefix, prefix + 2);
+        client->output.insert(client->output.end(), completion.response.begin(), completion.response.end());
+        client->last_activity = std::chrono::steady_clock::now();
+        modify_epoll(epoll_fd_, client->fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+        return;
+    }
+    if (completion.peer_length != 0) {
+        sendto(udp_fd_, completion.response.data(), completion.response.size(), 0,
+               reinterpret_cast<const sockaddr*>(&completion.peer), completion.peer_length);
     }
 }
 
@@ -342,16 +398,16 @@ void DnsServer::drain_tcp_completions() {
     while (!completions.empty()) {
         TcpCompletion completion = std::move(completions.front());
         completions.pop();
-        const int fd = completion.client->fd;
-        const auto found = clients_.find(fd);
-        if (found == clients_.end() || found->second != completion.client) continue;
-        const std::uint16_t length = htons(static_cast<std::uint16_t>(completion.response.size()));
-        const auto* prefix = reinterpret_cast<const std::uint8_t*>(&length);
-        completion.client->output.insert(completion.client->output.end(), prefix, prefix + 2);
-        completion.client->output.insert(completion.client->output.end(),
-                                         completion.response.begin(), completion.response.end());
-        completion.client->last_activity = std::chrono::steady_clock::now();
-        modify_epoll(epoll_fd_, fd, EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP);
+        if (completion.kind == TcpCompletion::Kind::UpstreamQuery) {
+            auto client = completion.client.lock();
+            if (completion.plan.tcp && !client) continue;
+            const auto query = completion.plan.query;
+            if (send_upstream(std::move(completion.plan), &completion.peer,
+                              completion.peer_length, client)) continue;
+            completion.response = processor_->overload_response(query.data(), query.size(),
+                                                                completion.tcp);
+        }
+        send_response(completion);
     }
 }
 
@@ -388,6 +444,10 @@ void DnsServer::read_tcp(const int fd) {
         if (received == 0) { close_client(fd); return; }
         if (received < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            close_client(fd);
+            return;
+        }
+        if (client->input.size() + static_cast<std::size_t>(received) > max_tcp_input_size) {
             close_client(fd);
             return;
         }
@@ -447,6 +507,7 @@ void DnsServer::event_loop() {
             }
         }
         const auto now = std::chrono::steady_clock::now();
+        processor_->cleanup_cache();
         expire_upstream_queries();
         for (auto iterator = clients_.begin(); iterator != clients_.end();) {
             if (now - iterator->second->last_activity > std::chrono::seconds(30)) {

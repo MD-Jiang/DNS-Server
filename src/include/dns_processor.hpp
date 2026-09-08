@@ -39,13 +39,12 @@ public:
     std::vector<std::uint8_t> finish_upstream(const DnsQueryPlan& plan,
                                               const std::uint8_t* data,
                                               std::size_t length) const;
+    void cleanup_cache() const;
     bool load_error() const noexcept;
     const std::string& error() const noexcept;
 
 private:
     std::vector<std::uint8_t> make_local_response(const DnsMessage& request, bool tcp) const;
-    std::vector<std::uint8_t> forward(const std::uint8_t* data, std::size_t length,
-                                      const DnsMessage& request) const;
     static std::string cache_key(const DnsQuestion& question);
     static void replace_id(std::vector<std::uint8_t>& response, std::uint16_t id);
 

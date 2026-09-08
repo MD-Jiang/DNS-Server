@@ -15,5 +15,7 @@ public:
     bool contains_name(const std::string& name) const;
 
 private:
+    bool load_file(const std::string& path, std::string& error, std::string& origin,
+                   std::uint32_t& default_ttl, std::size_t depth);
     std::unordered_map<std::string, std::vector<DnsResourceRecord>> records_;
 };

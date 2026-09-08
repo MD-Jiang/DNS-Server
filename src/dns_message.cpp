@@ -216,6 +216,16 @@ bool DnsMessage::parse(const std::uint8_t* data, const std::size_t length,
         for (std::uint16_t index = 0; index < count; ++index) {
             DnsResourceRecord record;
             if (!parse_record(data, length, offset, record, error)) return false;
+            if (&records == &message.additionals && record.type == 41 && record.name == ".") {
+                if (message.edns_present) {
+                    error = "multiple EDNS OPT records";
+                    return false;
+                }
+                message.edns_present = true;
+                message.edns_udp_payload = std::max<std::uint16_t>(record.klass, 512);
+                message.edns_version = static_cast<std::uint8_t>((record.ttl >> 16U) & 0xffU);
+                message.edns_dnssec_ok = (record.ttl & 0x8000U) != 0;
+            }
             records.push_back(std::move(record));
         }
         return true;

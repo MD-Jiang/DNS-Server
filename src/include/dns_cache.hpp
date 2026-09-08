@@ -21,6 +21,7 @@ public:
     explicit DnsCache(std::size_t capacity);
     bool get(const std::string& key, std::shared_ptr<const std::vector<std::uint8_t>>& response);
     void put(std::string key, std::vector<std::uint8_t> response, std::uint32_t ttl, bool negative);
+    void cleanup_expired();
 
 private:
     struct Entry {

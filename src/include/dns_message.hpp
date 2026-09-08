@@ -45,6 +45,10 @@ struct DnsResourceRecord {
 struct DnsMessage {
     std::uint16_t id = 0;
     DnsFlags flags;
+    std::uint16_t edns_udp_payload = 512;
+    std::uint8_t edns_version = 0;
+    bool edns_present = false;
+    bool edns_dnssec_ok = false;
     std::vector<DnsQuestion> questions;
     std::vector<DnsResourceRecord> answers;
     std::vector<DnsResourceRecord> authorities;
