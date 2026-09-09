@@ -6,6 +6,19 @@ const PIE_COLORS = {
   rcodes: ["#34d399","#f87171","#fb923c","#fbbf24","#94a3b8"],
 };
 
+// DNS 查询类型中文说明
+const QTYPE_LABELS = {
+  "A":     "IPv4 地址",
+  "AAAA":  "IPv6 地址",
+  "CNAME": "CNAME（别名）",
+  "MX":    "MX（邮件）",
+  "NS":    "NS（域名服务器）",
+  "PTR":   "PTR（反向解析）",
+  "TXT":   "TXT（文本记录）",
+  "SRV":   "SRV（服务定位）",
+  "ANY":   "ANY（任意类型）",
+};
+
 /* ── Chart.js global defaults ──────────────────────────────────────────────── */
 Chart.defaults.color          = "#94a3b8";
 Chart.defaults.borderColor    = "rgba(255,255,255,.06)";
@@ -68,19 +81,23 @@ function updateStats(d) {
   // Pie: query types
   if (Object.keys(d.query_types).length) {
     const typePairs = Object.entries(d.query_types).sort((a, b) => b[1] - a[1]);
-    chartTypes.data.labels   = typePairs.map(p => p[0]);
+    chartTypes.data.labels   = typePairs.map(p => QTYPE_LABELS[p[0]] || p[0]);
     chartTypes.data.datasets[0].data   = typePairs.map(p => p[1]);
     chartTypes.data.datasets[0].backgroundColor =
       typePairs.map((_, i) => PIE_COLORS.types[i % PIE_COLORS.types.length]);
     chartTypes.update("none");
   }
 
-  // Pie: rcodes
+  // Bar: rcodes
   if (Object.keys(d.rcodes).length) {
     const rcodePairs = Object.entries(d.rcodes).sort((a, b) => b[1] - a[1]);
     const rcolorMap  = { NOERROR: PIE_COLORS.rcodes[0], NXDOMAIN: PIE_COLORS.rcodes[1],
                          SERVFAIL: PIE_COLORS.rcodes[2], TIMEOUT: PIE_COLORS.rcodes[3] };
-    chartRcodes.data.labels   = rcodePairs.map(p => p[0]);
+    const total = rcodePairs.reduce((s, p) => s + p[1], 0);
+    chartRcodes.data.labels   = rcodePairs.map(p => {
+      const pct = total ? (p[1] / total * 100).toFixed(2) : "0.00";
+      return `${p[0]}  ${pct}%`;
+    });
     chartRcodes.data.datasets[0].data   = rcodePairs.map(p => p[1]);
     chartRcodes.data.datasets[0].backgroundColor =
       rcodePairs.map(p => rcolorMap[p[0]] || PIE_COLORS.rcodes[4]);
@@ -170,12 +187,15 @@ function formatBenchResult(d) {
     const pct = total ? Math.round((n / total) * 20) : 0;
     return "█".repeat(pct) + "░".repeat(20 - pct) + ` ${n}`;
   };
-  const domainSetLabel = d.domain_set === "local" ? "本地域名" : "外部域名";
+  const domainSetLabel = d.domain_set === "local" ? "本地域名"
+                       : d.domain_set === "cached" ? "缓存命中" : "外部域名";
+  const successRate = d.total ? (d.success / d.total * 100).toFixed(2) : "0.00";
   return [
     `模式       : ${d.mode}`,
     `域名集     : ${domainSetLabel}`,
     `总计       : ${d.total}  耗时: ${d.duration_s}s`,
     `QPS        : ${d.qps}`,
+    `成功率     : ${successRate}%`,
     ``,
     `成功       : ${bar(d.success,  d.total)}`,
     `失败       : ${bar(d.error,    d.total)}`,
@@ -231,7 +251,7 @@ function initCharts() {
 
   chartRcodes = new Chart(
     document.getElementById("chart-rcodes").getContext("2d"),
-    makePieConfig()
+    makeBarConfig()
   );
 }
 
@@ -247,6 +267,32 @@ function makePieConfig() {
         legend: {
           position: "bottom",
           labels: { boxWidth: 12, padding: 12, font: { size: 11 } },
+        },
+      },
+    },
+  };
+}
+
+function makeBarConfig() {
+  return {
+    type: "bar",
+    data: { labels: [], datasets: [{ data: [], backgroundColor: [], borderWidth: 0,
+      borderRadius: 4 }] },
+    options: {
+      animation: false,
+      indexAxis: "y",
+      plugins: {
+        legend: { display: false },
+      },
+      scales: {
+        x: {
+          beginAtZero: true,
+          grid: { color: "rgba(255,255,255,.05)" },
+          ticks: { font: { size: 11 } },
+        },
+        y: {
+          grid: { display: false },
+          ticks: { font: { size: 11 } },
         },
       },
     },

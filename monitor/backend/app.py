@@ -337,9 +337,9 @@ class BenchResult:
 
 
 _BENCH_DOMAINS = [
-    "google.com", "cloudflare.com", "github.com", "amazon.com", "microsoft.com",
-    "youtube.com", "facebook.com", "twitter.com", "reddit.com", "openai.com",
-    "wikipedia.org", "baidu.com", "taobao.com", "qq.com", "163.com",
+    "baidu.com", "taobao.com", "qq.com", "163.com", "jd.com",
+    "weibo.com", "zhihu.com", "bilibili.com", "aliyun.com", "tencent.com",
+    "sina.com.cn", "sohu.com", "douyin.com", "xiaomi.com", "huawei.com",
 ]
 
 _LOCAL_BENCH_DOMAINS = [
