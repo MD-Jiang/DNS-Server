@@ -11,7 +11,7 @@ services:
       - "--zone-file"
       - "/app/config/zone.db"
       - "--upstream"
-      - "223.5.5.5:53"
+      - "223.5.5.5:53,8.8.8.8:53,119.29.29.29:53"
       - "--threads"
       - "8"
       - "--cache-size"
