@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>DNS 监控面板</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<header>
+  <div class="header-inner">
+    <div class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/>
+        <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10A15.3 15.3 0 0 1 12 2z"/>
+      </svg>
+      DNS 监控面板
+    </div>
+    <div class="status-row">
+      <span class="badge" id="badge-server">● 服务器 —</span>
+      <span class="badge" id="badge-proxy">● 代理 —</span>
+      <span class="uptime" id="uptime">运行时长 —</span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <!-- KPI cards -->
+  <section class="kpi-grid">
+    <div class="card kpi">
+      <div class="kpi-label">总查询数</div>
+      <div class="kpi-val" id="kpi-total">—</div>
+    </div>
+    <div class="card kpi">
+      <div class="kpi-label">当前 QPS</div>
+      <div class="kpi-val" id="kpi-qps">—</div>
+    </div>
+    <div class="card kpi">
+      <div class="kpi-label">平均延迟</div>
+      <div class="kpi-val" id="kpi-avg">—</div>
+      <div class="kpi-sub" id="kpi-p95"></div>
+    </div>
+    <div class="card kpi">
+      <div class="kpi-label">进程 CPU</div>
+      <div class="kpi-val" id="kpi-cpu">—</div>
+      <div class="kpi-sub" id="kpi-mem"></div>
+    </div>
+  </section>
+
+  <!-- Charts row -->
+  <section class="charts-grid">
+    <div class="card chart-card wide">
+      <div class="card-title">每秒查询数（近 60 秒）</div>
+      <canvas id="chart-qps"></canvas>
+    </div>
+    <div class="card chart-card">
+      <div class="card-title">查询类型</div>
+      <canvas id="chart-types"></canvas>
+    </div>
+    <div class="card chart-card">
+      <div class="card-title">响应码</div>
+      <canvas id="chart-rcodes"></canvas>
+    </div>
+  </section>
+
+  <!-- Top domains -->
+  <section class="bottom-grid">
+    <div class="card">
+      <div class="card-title">热门域名 Top 10</div>
+      <table id="tbl-domains">
+        <thead><tr><th>#</th><th>域名</th><th>查询次数</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <!-- Benchmark panel -->
+    <div class="card">
+      <div class="card-title">性能测试</div>
+      <div class="bench-form">
+        <div class="form-row">
+          <label>模式</label>
+          <select id="bench-mode">
+            <option value="normal">常规压力</option>
+            <option value="stress">高并发压力</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>域名集</label>
+          <select id="bench-domain-set">
+            <option value="external">外部域名（端到端）</option>
+            <option value="local">本地域名（纯本地）</option>
+            <option value="cached">缓存命中（预热后测速）</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label>目标主机</label>
+          <input id="bench-host" type="text" value="" placeholder="dns_server" />
+        </div>
+        <div class="form-row">
+          <label>目标端口</label>
+          <input id="bench-port" type="number" value="2053" />
+        </div>
+        <div class="form-row">
+          <label>并发数</label>
+          <input id="bench-concurrency" type="number" value="20" />
+        </div>
+        <div class="form-row">
+          <label>总请求数</label>
+          <input id="bench-total" type="number" value="500" />
+        </div>
+        <button id="bench-run">▶ 开始测试</button>
+      </div>
+      <div id="bench-result" class="bench-result hidden"></div>
+    </div>
+  </section>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
