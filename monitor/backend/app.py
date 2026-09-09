@@ -176,6 +176,13 @@ class DnsProxyProtocol(asyncio.DatagramProtocol):
             await stats.record(
                 DNS_TYPES.get(qtype, str(qtype)), domain, "TIMEOUT", 5.0
             )
+            # reply SERVFAIL so the client does not hang until its own timeout
+            if self.transport and len(data) >= 2:
+                sf = bytearray(12)
+                sf[0], sf[1] = data[0], data[1]   # copy txid
+                sf[2] = 0x80   # QR=1
+                sf[3] = 0x02   # RCODE=SERVFAIL
+                self.transport.sendto(bytes(sf), addr)
             return
         latency = time.monotonic() - t0
         try:
@@ -192,15 +199,21 @@ class DnsProxyProtocol(asyncio.DatagramProtocol):
     async def _forward(self, data: bytes) -> bytes:
         loop = asyncio.get_event_loop()
         future: asyncio.Future = loop.create_future()
-        txid = struct.unpack_from("!H", data, 0)[0]
-        # send to C++ server
+        orig_txid = struct.unpack_from("!H", data, 0)[0]
+        # assign a unique internal id to avoid txid collisions under high concurrency
+        internal_id = id(future) & 0xFFFF
+        while internal_id in _pending_upstream or internal_id == 0:
+            internal_id = (internal_id + 1) & 0xFFFF
+        # rewrite txid in the forwarded packet
+        rewritten = bytearray(data)
+        struct.pack_into("!H", rewritten, 0, internal_id)
         sock = _upstream_sock
-        sock.sendto(data, (DNS_SERVER_HOST, DNS_SERVER_PORT))
-        _pending_upstream[txid] = future
+        sock.sendto(bytes(rewritten), (DNS_SERVER_HOST, DNS_SERVER_PORT))
+        _pending_upstream[internal_id] = (future, orig_txid)
         try:
             return await asyncio.wait_for(future, timeout=4.9)
         finally:
-            _pending_upstream.pop(txid, None)
+            _pending_upstream.pop(internal_id, None)
 
 
 _pending_upstream: Dict[int, asyncio.Future] = {}
@@ -210,12 +223,18 @@ _upstream_sock = None   # raw UDP socket set up at startup
 class UpstreamProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, _addr):
         try:
-            txid = struct.unpack_from("!H", data, 0)[0]
+            internal_id = struct.unpack_from("!H", data, 0)[0]
         except Exception:
             return
-        fut = _pending_upstream.get(txid)
+        entry = _pending_upstream.get(internal_id)
+        if entry is None:
+            return
+        fut, orig_txid = entry
         if fut and not fut.done():
-            fut.set_result(data)
+            # restore original txid before passing response back to client
+            response = bytearray(data)
+            struct.pack_into("!H", response, 0, orig_txid)
+            fut.set_result(bytes(response))
 
 # ── Performance tester ────────────────────────────────────────────────────────
 @dataclass
@@ -300,9 +319,7 @@ async def _single_udp_query(host: str, port: int, data: bytes,
                 if not fut.done():
                     fut.set_exception(exc)
             def connection_lost(self, _):
-                # only signal failure if we haven't resolved yet
-                if not fut.done():
-                    fut.set_exception(ConnectionError("connection lost"))
+                pass  # transport closed after response; do not fail the future
 
         transport, _ = await loop.create_datagram_endpoint(
             _OneShot, remote_addr=(host, port)
@@ -346,6 +363,7 @@ async def run_benchmark(mode: str, concurrency: int,
         nonlocal ok, err, tout
         domain = random.choice(domains)
         data   = _make_dns_query(domain)
+        qtype_str = DNS_TYPES.get(1, "A")
         async with sem:
             success, lat, rcode = await _single_udp_query(
                 target_host, target_port, data, timeout=3.0
@@ -358,6 +376,7 @@ async def run_benchmark(mode: str, concurrency: int,
         else:
             ok += 1
         lats.append(lat)
+        await stats.record(qtype_str, domain, rcode if not success else "NOERROR", lat)
 
     t0 = time.monotonic()
     remaining = total
@@ -442,6 +461,7 @@ async def get_process():
 async def server_health():
     """Quick UDP ping to the C++ DNS server."""
     data = _make_dns_query("health.check.local")
+    t = None
     try:
         loop = asyncio.get_event_loop()
         fut: asyncio.Future = loop.create_future()
@@ -457,10 +477,12 @@ async def server_health():
         )
         t.sendto(data)
         await asyncio.wait_for(fut, timeout=1.5)
-        t.close()
         return {"online": True}
     except Exception:
         return {"online": False}
+    finally:
+        if t is not None:
+            t.close()
 
 
 @app.post("/api/bench")
