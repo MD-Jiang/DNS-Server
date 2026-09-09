@@ -3,13 +3,16 @@ import asyncio
 import struct
 import time
 import os
+import logging
 import collections
 import statistics
 import random
 import string
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from contextlib import asynccontextmanager
+from logging.handlers import TimedRotatingFileHandler
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,6 +35,43 @@ RCODES    = {0:"NOERROR", 1:"FORMERR", 2:"SERVFAIL",
              3:"NXDOMAIN", 4:"NOTIMP",  5:"REFUSED"}
 MAX_LATENCY_SAMPLES = 10_000
 QPS_WINDOW_SECONDS  = 60
+LOG_DIR = Path(__file__).resolve().parents[1] / "log"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / "dns_monitor.log"
+
+
+def configure_logging() -> logging.Logger:
+    logger = logging.getLogger("dns_monitor")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    stream_handler.setLevel(logging.INFO)
+
+    file_handler = TimedRotatingFileHandler(
+        LOG_FILE,
+        when="midnight",
+        interval=1,
+        backupCount=7,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+
+    logger.addHandler(stream_handler)
+    logger.addHandler(file_handler)
+    return logger
+
+
+logger = configure_logging()
 
 # ── Stats store ──────────────────────────────────────────────────────────────
 class StatsStore:
@@ -66,6 +106,12 @@ class StatsStore:
                 self._cur_count  = 1
             else:
                 self._cur_count += 1
+
+            if rcode == "TIMEOUT" or latency > 0.5:
+                logger.warning(
+                    "slow_or_timeout dns qtype=%s domain=%s rcode=%s latency_ms=%.2f",
+                    qtype, domain, rcode, latency * 1000,
+                )
 
     async def snapshot(self) -> dict:
         async with self.lock:
@@ -166,6 +212,7 @@ class DnsProxyProtocol(asyncio.DatagramProtocol):
             txid, qtype, _ = parse_dns_header(data)
             domain = decode_qname(data)
         except Exception:
+            logger.warning("failed_to_parse_dns_packet length=%s addr=%s", len(data), addr)
             return
         t0 = time.monotonic()
         try:
@@ -175,6 +222,14 @@ class DnsProxyProtocol(asyncio.DatagramProtocol):
         except asyncio.TimeoutError:
             await stats.record(
                 DNS_TYPES.get(qtype, str(qtype)), domain, "TIMEOUT", 5.0
+            )
+            logger.warning(
+                "dns_upstream_timeout domain=%s qtype=%s addr=%s upstream=%s:%s",
+                domain,
+                DNS_TYPES.get(qtype, str(qtype)),
+                addr,
+                DNS_SERVER_HOST,
+                DNS_SERVER_PORT,
             )
             # reply SERVFAIL so the client does not hang until its own timeout
             if self.transport and len(data) >= 2:
@@ -193,6 +248,14 @@ class DnsProxyProtocol(asyncio.DatagramProtocol):
         await stats.record(
             DNS_TYPES.get(qtype, str(qtype)), domain, rcode_str, latency
         )
+        if latency > 0.25:
+            logger.warning(
+                "slow_dns_response domain=%s qtype=%s rcode=%s latency_ms=%.2f",
+                domain,
+                DNS_TYPES.get(qtype, str(qtype)),
+                rcode_str,
+                latency * 1000,
+            )
         if self.transport:
             self.transport.sendto(resp, addr)
 
@@ -343,6 +406,15 @@ async def run_benchmark(mode: str, concurrency: int,
                         target_port: int,
                         domain_set: str = "external") -> BenchResult:
     """Fire `total` queries with `concurrency` simultaneous coroutines, in batches."""
+    logger.info(
+        "benchmark_start mode=%s concurrency=%s total=%s target=%s:%s domain_set=%s",
+        mode,
+        concurrency,
+        total,
+        target_host,
+        target_port,
+        domain_set,
+    )
     if domain_set == "cached":
         # Phase 1: warm up cache by querying each domain once serially
         for domain in _BENCH_DOMAINS:
@@ -385,12 +457,28 @@ async def run_benchmark(mode: str, concurrency: int,
         await asyncio.gather(*[_one() for _ in range(chunk)])
         remaining -= chunk
     dur = time.monotonic() - t0
-    return BenchResult(
+    result = BenchResult(
         mode=mode, total_queries=total, duration_s=dur,
         qps=total / dur if dur else 0,
         success=ok, error=err, timeout=tout, latencies=lats,
         domain_set=domain_set,
     )
+    if result.latencies:
+        lat_ms = sorted(result.latencies)
+        p95_ms = lat_ms[int(len(lat_ms) * 0.95)] * 1000
+        logger.info(
+            "benchmark_summary mode=%s success=%s error=%s timeout=%s qps=%.2f p95_ms=%.2f avg_ms=%.2f",
+            mode,
+            ok,
+            err,
+            tout,
+            result.qps,
+            p95_ms,
+            statistics.mean(result.latencies or [0]) * 1000,
+        )
+    else:
+        logger.info("benchmark_summary mode=%s no_latency_samples", mode)
+    return result
 
 # ── FastAPI app & lifespan ────────────────────────────────────────────────────
 @asynccontextmanager
@@ -409,7 +497,12 @@ async def lifespan(app: FastAPI):
         DnsProxyProtocol,
         local_addr=("0.0.0.0", PROXY_PORT),
     )
-    print(f"DNS proxy listening on UDP :{PROXY_PORT} -> {DNS_SERVER_HOST}:{DNS_SERVER_PORT}")
+    logger.info(
+        "dns_proxy_listening udp_port=%s upstream=%s:%s",
+        PROXY_PORT,
+        DNS_SERVER_HOST,
+        DNS_SERVER_PORT,
+    )
     yield
     proxy_transport.close()
     _transport.close()
