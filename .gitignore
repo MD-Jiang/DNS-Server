@@ -47,3 +47,7 @@ _deps
 
 build/
 vcpkg_installed
+
+# Runtime logs
+monitor/log/*
+!monitor/log/.gitkeep

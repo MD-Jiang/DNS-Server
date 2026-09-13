@@ -25,6 +25,7 @@ FROM python:3.12-slim-bookworm AS runtime
 WORKDIR /app
 
 COPY --from=builder /app/build/server ./server
+COPY --from=builder /app/build/dns_concurrency_test ./dns_concurrency_test
 COPY config ./config
 
 EXPOSE 2053/udp

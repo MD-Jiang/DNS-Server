@@ -11,12 +11,39 @@ services:
       - "--zone-file"
       - "/app/config/zone.db"
       - "--upstream"
-      - "223.5.5.5:53"
+      - "223.5.5.5:53,8.8.8.8:53,119.29.29.29:53"
       - "--threads"
-      - "4"
+      - "8"
       - "--cache-size"
-      - "1024"
+      - "10000"
     ports:
       - "2053:2053/udp"
       - "15353:2053/tcp"
     restart: unless-stopped
+    networks:
+      - dns-net
+
+  dns-monitor:
+    build:
+      context: ./monitor
+      dockerfile: Dockerfile
+    image: dns-monitor:latest
+    container_name: dns-monitor
+    environment:
+      DNS_SERVER_HOST: dns-server
+      DNS_SERVER_PORT: "2053"
+      PROXY_PORT: "5353"
+      HTTP_PORT: "8080"
+      DNS_PROC_NAME: dns_server
+    ports:
+      - "8080:8080"    # dashboard
+      - "5354:5353/udp"  # DNS proxy (5353 is reserved by Windows mDNS)
+    depends_on:
+      - dns-server
+    restart: unless-stopped
+    networks:
+      - dns-net
+
+networks:
+  dns-net:
+    driver: bridge

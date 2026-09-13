@@ -1,0 +1,233 @@
+/* ── Tokens ─────────────────────────────────────────────────────────────── */
+:root {
+  --bg-0:      oklch(14% 0.01 260);
+  --bg-1:      oklch(18% 0.01 260);
+  --bg-2:      oklch(22% 0.015 260);
+  --border:    oklch(30% 0.015 260);
+  --text-1:    oklch(92% 0.01 260);
+  --text-2:    oklch(62% 0.01 260);
+  --accent:    oklch(68% 0.18 200);
+  --accent-dim:oklch(40% 0.12 200);
+  --success:   oklch(68% 0.18 145);
+  --danger:    oklch(62% 0.20 25);
+  --warn:      oklch(72% 0.18 80);
+  --radius-s:  4px;
+  --radius-m:  8px;
+  --radius-l:  12px;
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px;
+  --sp-4: 16px; --sp-6: 24px; --sp-8: 32px;
+}
+
+/* ── Reset / base ───────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 15px; }
+body {
+  background: var(--bg-0);
+  color: var(--text-1);
+  font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  line-height: 1.55;
+  min-height: 100vh;
+}
+a { color: var(--accent); text-decoration: none; }
+
+/* ── Header ─────────────────────────────────────────────────────────────── */
+header {
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+.header-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: var(--sp-3) var(--sp-6);
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+}
+.logo {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text-1);
+}
+.logo svg { color: var(--accent); flex-shrink: 0; }
+.status-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-4);
+  margin-left: auto;
+  font-size: 0.82rem;
+}
+.badge { color: var(--text-2); }
+.badge.ok   { color: var(--success); }
+.badge.down { color: var(--danger); }
+.uptime { color: var(--text-2); }
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+main {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: var(--sp-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-6);
+}
+
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-l);
+  padding: var(--sp-6);
+}
+.card-title {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  margin-bottom: var(--sp-4);
+}
+
+/* ── KPI grid ───────────────────────────────────────────────────────────── */
+.kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--sp-4);
+}
+.kpi { padding: var(--sp-4) var(--sp-6); }
+.kpi-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  margin-bottom: var(--sp-2);
+}
+.kpi-val {
+  font-size: 2rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  color: var(--text-1);
+}
+.kpi-sub {
+  font-size: 0.8rem;
+  color: var(--text-2);
+  margin-top: var(--sp-1);
+}
+
+/* ── Charts grid ────────────────────────────────────────────────────────── */
+.charts-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr;
+  gap: var(--sp-4);
+}
+.chart-card canvas { width: 100% !important; }
+.chart-card.wide canvas { max-height: 200px; }
+.chart-card:not(.wide) canvas { max-height: 220px; }
+
+/* ── Bottom grid ────────────────────────────────────────────────────────── */
+.bottom-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--sp-4);
+  align-items: start;
+}
+
+/* ── Table ──────────────────────────────────────────────────────────────── */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+th {
+  text-align: left;
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  border-bottom: 1px solid var(--border);
+}
+td {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid color-mix(in oklch, var(--border) 50%, transparent);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-1);
+}
+td:last-child { text-align: right; color: var(--accent); }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--bg-2); }
+
+/* ── Benchmark form ─────────────────────────────────────────────────────── */
+.bench-form { display: flex; flex-direction: column; gap: var(--sp-3); }
+.form-row {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  align-items: center;
+  gap: var(--sp-3);
+}
+.form-row label { font-size: 0.82rem; color: var(--text-2); }
+input[type="text"],
+input[type="number"],
+select {
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-s);
+  color: var(--text-1);
+  padding: var(--sp-2) var(--sp-3);
+  font-size: 0.85rem;
+  width: 100%;
+  outline: none;
+  transition: border-color 120ms ease;
+}
+input:focus, select:focus { border-color: var(--accent); }
+button#bench-run {
+  margin-top: var(--sp-2);
+  padding: var(--sp-2) var(--sp-4);
+  background: var(--accent-dim);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-s);
+  color: var(--accent);
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+  align-self: flex-start;
+}
+button#bench-run:hover { background: var(--accent); color: var(--bg-0); }
+button#bench-run:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Bench result ───────────────────────────────────────────────────────── */
+.bench-result {
+  margin-top: var(--sp-4);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-m);
+  padding: var(--sp-4);
+  font-size: 0.82rem;
+  font-family: ui-monospace, 'Cascadia Code', monospace;
+  white-space: pre-wrap;
+  color: var(--text-1);
+  line-height: 1.7;
+}
+.bench-result.hidden { display: none; }
+
+/* ── Responsive ─────────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .charts-grid { grid-template-columns: 1fr; }
+  .bottom-grid  { grid-template-columns: 1fr; }
+}
+@media (max-width: 560px) {
+  main { padding: var(--sp-4); }
+  .kpi-grid { grid-template-columns: 1fr 1fr; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
